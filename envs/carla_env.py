@@ -14,6 +14,7 @@ from gym import spaces, core
 
 import torch
 from observation.obs_bev import BEVObservation
+from algo.mappo.mappo_manager import MAPPOManager
 
 class CarlaEnv(gym.Env):
     def __init__(self, num_veh, num_ped, mode="MAPPO"):
@@ -58,6 +59,9 @@ class CarlaEnv(gym.Env):
         self.ego_vehicle_wrapper = None  # keep if you use VehicleWrapper; else may remain None
         self.vehicle_wrapper_list = {}
         self.pedestrian_wrapper_list = {}
+
+        self.mappo_manager = MAPPOManager()
+
 
         # --- allowed vehicle blueprints (you can keep or reduce) ---
         self.allowed_brands = [
@@ -173,8 +177,8 @@ class CarlaEnv(gym.Env):
             ids_to_destroy.append(self.ego_vehicle.id)
             print(f"🧹 Destroying ego vehicle {self.ego_vehicle.id}")
 
-        ids_to_destroy += [v.id for v in self.vehicles if v is not None and v.is_alive]
-        ids_to_destroy += [p.id for p in self.pedestrians if p is not None and p.is_alive]
+        ids_to_destroy += list(self.vehicle_wrapper_list.keys())
+        ids_to_destroy += list(self.pedestrian_wrapper_list.keys())
 
         if ids_to_destroy:
             self.client.apply_batch([carla.command.DestroyActor(x) for x in ids_to_destroy])
@@ -205,50 +209,55 @@ class CarlaEnv(gym.Env):
         self.distance_travelled = 0.0
         self.last_location = None
 
-    def reset(self):
-        print("🔁 Resetting CarlaEnv...")
-        # Destroy existing actors
-        ids_to_destroy = []
-        if self.ego_vehicle is not None and self.ego_vehicle.is_alive:
-            ids_to_destroy.append(self.ego_vehicle.id)
-            print(f"🧹 Destroying ego vehicle {self.ego_vehicle.id}")
+        state = self.get_state()
 
-        ids_to_destroy += [v.id for v in self.vehicles if v is not None and v.is_alive]
-        ids_to_destroy += [p.id for p in self.pedestrians if p is not None and p.is_alive]
-
-        if ids_to_destroy:
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in ids_to_destroy])
-            print(f"✅ Destroyed {len(ids_to_destroy)} actors.")
-        else:
-            print("⚠️ No actors to destroy.")
-
-        self.vehicles = []
-        self.pedestrians = []
-        self.ego_vehicle = None
-        self.vehicle_wrapper_list = {}
-
-        self.destroy_sensors()
-        self.collision_happened = False
-
-        time.sleep(0.5)
-        self.world.tick()
-
-        self.soft_reboot()
-        self.vehicle_map = self._group_vehicles_by_road_and_lane()
-
-        self.ego_vehicle_wrapper.update_observation(self)
-        for wrapper in self.vehicle_wrapper_list.values():
-            wrapper.update_observation(self)
-
-        self.start_location = self.ego_vehicle.get_location()
-        self.start_time = self.get_simulation_time()
-        self.distance_travelled = 0.0
-        self.last_location = None
-
-        self.episode_info["start_time"] = self.get_simulation_time()
-        return self.get_state()
+        if hasattr(self, "mappo_agent"):
+            self.mappo_manager.mappo_reset(state)
+        return state
 
     def get_state(self):
         obs = BEVObservation(veh_id=self.ego_vehicle.id, time_stamp=self.get_simulation_time())
         obs.update(env=self)
         return obs.information
+
+    def setup_sensors(self):
+        # Collision sensor
+        # if self.collision_sensor is None or not self.collision_sensor.is_alive:
+        #     sensor_bp = self.blueprint_library.find('sensor.other.collision')
+        #     sensor_transform = carla.Transform(carla.Location(x=0, y=0, z=2))
+        #     self.collision_sensor = self.world.spawn_actor(sensor_bp, sensor_transform, attach_to=self.ego_vehicle)
+        #     self.collision_sensor.listen(lambda event: self._on_collision(event))
+
+        # RGB camera sensor
+        if self.camera_sensor is None or not self.camera_sensor.is_alive:
+            camera_bp = self.blueprint_library.find('sensor.camera.rgb')
+            camera_bp.set_attribute('image_size_x', '800')
+            camera_bp.set_attribute('image_size_y', '600')
+            camera_bp.set_attribute('fov', '90')
+
+            camera_transform = carla.Transform(
+                carla.Location(x=-6.5, y=0, z=2.5),
+                carla.Rotation(pitch=-15, yaw=0, roll=0)
+            )
+
+            self.camera_sensor = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.ego_vehicle)
+            self.camera_sensor.listen(lambda image: self._process_camera_image(image))
+
+        self._tick()
+        self._tick()
+        self._camera_ready = True
+
+    def _tick(self, timeout_seconds=None):
+        if self.world.get_settings().synchronous_mode:
+            if timeout_seconds is None:
+                return self.world.tick()
+            else:
+                return self.world.tick(timeout_seconds)
+        else:
+            if timeout_seconds is None:
+                return self.world.tick()
+            else:
+                if timeout_seconds is None:
+                    return self.world.tick()
+                else:
+                    return self.world.tick()
