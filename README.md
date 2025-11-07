@@ -23,6 +23,20 @@ GRU input shape [T, B, 512] → seq_feat [T, B, 256]
 Hidden reset at episode boundary: h[:, done_idxs] = 0 (use done mask)  
 bev_t = seq_feat[t] → [B, 256]
 
+
+Case B: use_slot_gru = False
+───────────────────────────────────────────────────────────────────────
+
+BEV Image ─────────▶ BEVFeatureExtractor ─▶ BEV_emb (256)
+agent_type_id ─────▶ Embedding ───────────▶ type_emb
+Per-agent obs (speed, etc) ───────────────▶ obs
+
+Actor path:
+    concat([obs, BEV_emb, type_emb]) ─▶ ActorHeads ─▶ actions
+
+Critic path:
+    obs ─▶ ctx_mlp ─▶ ctx_vecs ─▶ pool(sum/mean) ─▶ global_ctx
+    concat([obs, BEV_emb, type_emb, global_ctx]) ─▶ CriticPerAgent ─▶ value
 ---
 
 ### Data Flow
