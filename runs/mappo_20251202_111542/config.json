@@ -1,0 +1,16 @@
+{
+  "num_envs": 1,
+  "num_steps": 128,
+  "num_epochs": 10000,
+  "device": "cpu",
+  "num_vehicles": 30,
+  "num_pedestrians": 0,
+  "tm_port": 8000,
+  "save_dir": "./checkpoints",
+  "log_interval": 1,
+  "checkpoint_every": 50,
+  "manager_cfg": {
+    "agent_specs": null,
+    "device": "cpu"
+  }
+}

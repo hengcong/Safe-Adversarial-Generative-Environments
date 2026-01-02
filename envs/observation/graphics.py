@@ -1,119 +1,100 @@
-import cv2
-import matplotlib.pyplot as plt
+# envs/observation/graphics.py
+# Headless-friendly graphics utilities for observation rendering.
+# Replaces pygame usage with numpy + cv2 where needed.
 import numpy as np
-import pygame
-import tqdm
-from absl import logging
+import cv2
+import time
+from typing import Tuple, Any, Optional
 
-# Color palette, the RGB values found at https://brandpalettes.com/.
-COLORS = {
-    # Default palette.
-    "WHITE": pygame.Color(255, 255, 255),
-    "BLACK": pygame.Color(0, 0, 0),
-    "RED": pygame.Color(255, 0, 0),
-    "GREEN": pygame.Color(0, 255, 0),
-    "BLUE": pygame.Color(0, 0, 255),
-    "SILVER": pygame.Color(195, 195, 195),
-    # Google palette.
-    "GOOGLE BLUE": pygame.Color(66, 133, 244),
-    "GOOGLE RED": pygame.Color(219, 68, 55),
-    "GOOGLE YELLOW": pygame.Color(244, 160, 0),
-    "GOOGLE GREEN": pygame.Color(15, 157, 88),
-    # Apple palettte.
-    "APPLE MIDNIGHT GREEN": pygame.Color(78, 88, 81),
-    "APPLE SPACE GREY": pygame.Color(83, 81, 80),
-    "APPLE ROSE GOLD": pygame.Color(250, 215, 189),
-    "APPLE LIGHT PURPLE": pygame.Color(209, 205, 218),
-    "APPLE LIGHT YELLOW": pygame.Color(255, 230, 129),
-    "APPLE LIGHT GREEN": pygame.Color(255, 230, 129),
-    "APPLE SILVER": pygame.Color(163, 170, 174),
-    "APPLE BLACK": pygame.Color(31, 32, 32),
-    "APPLE WHITE": pygame.Color(249, 246, 239),
-    "APPLE RED": pygame.Color(165, 40, 44),
-    "APPLE GOLD": pygame.Color(245, 221, 197),
-    # Slack palette.
-    "SLACK AUBERGINE": pygame.Color(74, 21, 75),
-    "SLACK BLUE": pygame.Color(54, 197, 240),
-    # Other palettes.
-    "AMAZON ORANGE": pygame.Color(255, 153, 0),
-    "FACEBOOK BLUE": pygame.Color(66, 103, 178),
-    "AIRBNB CORAL": pygame.Color(255, 88, 93),
-    "DR.PEPPER MAROON": pygame.Color(113, 31, 37),
-}
+# Simple HUD-like class exposing a render() method used by envs
+class HUD:
+    def __init__(self, width: int = 800, height: int = 600, enable_render: bool = False):
+        self.width = width
+        self.height = height
+        self.enable_render = bool(enable_render)
+        self.font_scale = 0.6
+        self.font_thickness = 1
+        self.text_color = (255, 255, 0)  # BGR
+        self.background_color = (0, 0, 0)
+        self.last_time = time.time()
+        self.fps = 0.0
 
-WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
+    def ensure_canvas(self, canvas: Optional[np.ndarray]) -> np.ndarray:
+        if canvas is None:
+            canvas = np.full((self.height, self.width, 3), fill_value=0, dtype=np.uint8)
+        h, w = canvas.shape[:2]
+        if (h, w) != (self.height, self.width):
+            canvas = cv2.resize(canvas, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        return canvas
 
-def setup(
-    width: int = 400,
-    height: int = 300,
-    render: bool = True,
-):
-    """Returns the `display`, `clock` and for a `PyGame` app.
+    def draw_text(self, canvas: np.ndarray, text: str, pos: Tuple[int,int] = (10, 20)):
+        cv2.putText(canvas, text, pos, cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, self.text_color, self.font_thickness, cv2.LINE_AA)
 
-    Args:
-        width: The width (in pixels) of the app window.
-        height: The height (in pixels) of the app window.
-        render: If True it renders a window, it keeps the
-        frame buffer on the memory otherwise.
+    def update_fps(self):
+        t = time.time()
+        dt = t - self.last_time if t - self.last_time > 1e-6 else 1.0
+        self.fps = 1.0 / dt
+        self.last_time = t
 
-    Returns:
-        display: The main app window or frame buffer object.
-        clock: The main app clock.
-        font: The font object used for generating text.
+    def render(self, canvas: Optional[np.ndarray] = None, info: Optional[dict] = None) -> np.ndarray:
+        """
+        Render HUD info onto a numpy canvas and return it.
+        If enable_render is False, it still returns a valid canvas (useful for headless debug).
+        """
+        canvas = self.ensure_canvas(canvas)
+        self.update_fps()
+        self.draw_text(canvas, f"FPS: {self.fps:.1f}", (10, 20))
+        if info:
+            y = 40
+            for k, v in info.items():
+                txt = f"{k}: {v}"
+                self.draw_text(canvas, txt, (10, y))
+                y += 18
+        return canvas
+
+# Minimal ModuleWorld-like helper to composite layers (keeps original API shape)
+class ModuleWorld:
+    def __init__(self, map_surface: np.ndarray, bev_size: Tuple[int,int] = (84,84)):
+        """
+        map_surface : big map (numpy BGR)
+        """
+        self.map_surface = map_surface
+        self.bev_size = bev_size
+        # layers as numpy arrays same size as map_surface
+        H, W = map_surface.shape[:2]
+        self.vehicle_layer = np.zeros((H, W, 3), dtype=np.uint8)
+        self.walker_layer = np.zeros((H, W, 3), dtype=np.uint8)
+        self.traffic_layer = np.zeros((H, W, 3), dtype=np.uint8)
+
+    def clear_layers(self):
+        self.vehicle_layer.fill(0)
+        self.walker_layer.fill(0)
+        self.traffic_layer.fill(0)
+
+    def draw_actor(self, layer: np.ndarray, px: int, py: int, color: Tuple[int,int,int], radius_px: int = 3):
+        cv2.circle(layer, (px, py), radius=radius_px, color=color, thickness=-1)
+
+    def composite_patch(self, center_px: Tuple[int,int], patch_px: int) -> np.ndarray:
+        """
+        Composite map + layers into a single patch around center_px, returning HxWx3 BGR uint8
+        """
+        cx, cy = center_px
+        half = patch_px // 2
+        x0 = cx - half; y0 = cy - half; x1 = cx + half; y1 = cy + half
+        H, W = self.map_surface.shape[:2]
+        patch = np.zeros((patch_px, patch_px, 3), dtype=np.uint8)
+        # compute source region
+        sx0 = max(0, x0); sy0 = max(0, y0); sx1 = min(W, x1); sy1 = min(H, y1)
+        dx0 = sx0 - x0; dy0 = sy0 - y0
+        if sx1 > sx0 and sy1 > sy0:
+            base = self.map_surface[sy0:sy1, sx0:sx1]
+            layer = self.vehicle_layer[sy0:sy1, sx0:sx1]
+            patch[dy0:dy0+base.shape[0], dx0:dx0+base.shape[1]] = cv2.addWeighted(base, 0.9, layer, 0.7, 0)
+        return patch
+
+# simple visualize wrapper (keeps API name)
+def visualize_birdview(bev_img: np.ndarray) -> np.ndarray:
     """
-    # PyGame setup.
-    pygame.init()  # pylint: disable=no-member
-    pygame.display.set_caption("OATomobile")
-    if render:
-        logging.debug("PyGame initializes a window display")
-        display = pygame.display.set_mode(  # pylint: disable=no-member
-            (width, height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF,  # pylint: disable=no-member
-        )
-    else:
-        logging.debug("PyGame initializes a headless display")
-        display = pygame.Surface((width, height))  # pylint: disable=too-many-function-args
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont("dejavusansmono", 14)
-    return display, clock, font
-
-def make_dashboard(display, font, clock, observations) -> None:
-    """Generates the dashboard used for visualizing the agent.
-
-    Args:
-        display: The `PyGame` renderable surface.
-        observations: The aggregated observation object.
-        font: The font object used for generating text.
-        clock: The PyGame (client) clock.
+    Accepts HxWx3 BGR uint8, returns same image (or scales for display)
     """
-    # Clear dashboard.
-    display.fill(COLORS["BLACK"])
-
-    # Adaptive width.
-    ada_width = 0
-
-    if "preview_camera" in observations:
-        # Render front camera view.
-        ob_preview_camera_rgb = ndarray_to_pygame_surface(
-            array=observations.get("preview_camera"),
-            swapaxes=True,
-        )
-        display.blit(ob_preview_camera_rgb, (ada_width, 0))
-        ada_width = ada_width + ob_preview_camera_rgb.get_width()
-
-def ndarray_to_pygame_surface(array, swapaxes):
-
-    """Returns a `PyGame` surface from a `NumPy` array (image).
-
-    Args:
-        array: The `NumPy` representation of the image to be converted to `PyGame`.
-
-    Returns:
-        A `PyGame` surface.
-    """
-    # Make sure its in 0-255 range.
-    array = 255 * (array / array.max())
-    if swapaxes:
-        array = array.swapaxes(0, 1)
-    return pygame.surfarray.make_surface(array)   
+    return bev_img.copy()

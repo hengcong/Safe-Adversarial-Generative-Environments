@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 
 _LOG_2PI = math.log(2.0 * math.pi)
 LOG_STD_MIN = -20.0
@@ -54,8 +55,8 @@ class MAPPOPolicy(nn.Module):
                  # SAGE / environment specific
                  bev_in_ch: int,
                  obs_dim: int,
-                 act_dim_vehicle: int,
-                 act_dim_ped: int,
+                 act_dim_vehicle= 4,
+                 act_dim_ped: Optional[int] = 4,
 
                  # basic MAPPO elements
                  type_vocab_size: int = 2,
@@ -74,6 +75,8 @@ class MAPPOPolicy(nn.Module):
                  device: str = "cpu") -> None:
         super().__init__()
 
+        if act_dim_ped is None:
+            act_dim_ped = act_dim_vehicle
         # -------------------------
         # Save core hyperparams
         # -------------------------
@@ -452,6 +455,83 @@ class MAPPOPolicy(nn.Module):
 
         return outputs
 
+    def burn_in(self, obs_seq: Dict[str, torch.Tensor],
+                slot_hidden: Optional[torch.Tensor] = None,
+                bev_hidden: Optional[torch.Tensor] = None,
+                mask: Optional[torch.Tensor] = None,
+                detach: bool = True) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Warm up policy hidden states from an observation sequence by reusing forward(mode='seq').
+
+        Args:
+            obs_seq: dict in the same format forward(..., mode='seq') expects, e.g.
+                     {"image": Tensor[T,B,C,H,W], "agent_feats": Tensor[T,B,N,obs_dim], "type_id": ...}
+            slot_hidden: optional initial [B,N,H] or [T,B,N,H]
+            bev_hidden: optional initial bev hidden
+            mask: optional mask tensor (T,B,N) or (B,N)
+            detach: if True, detach returned hidden tensors
+
+        Returns:
+            (next_slot_hidden, next_bev_hidden) where next_slot_hidden is [B,N,H] or None.
+        """
+        # ensure obs_seq tensor devices match policy device
+        # move obs_seq tensors to policy device if they are torch tensors
+        obs_on_device = {}
+        if torch.is_tensor(obs_seq):
+            obs_seq = {"agent_feats": obs_seq.to(self.device)}
+        elif isinstance(obs_seq, np.ndarray):
+            obs_seq = {"agent_feats": torch.tensor(obs_seq, device=self.device)}
+        for k, v in obs_seq.items():
+            if torch.is_tensor(v):
+                obs_on_device[k] = v.to(self.device)
+            else:
+                obs_on_device[k] = v
+
+        # call forward in seq mode under no_grad by default (burn-in shouldn't create graph)
+        with torch.no_grad():
+            out = self.forward(
+                obs=obs_on_device,
+                slot_hidden=slot_hidden,
+                bev_hidden=bev_hidden,
+                mask=mask,
+                mode="seq",
+                deterministic=True
+            )
+
+        # extract hidden states from forward outputs (support multiple key names)
+        next_slot = out.get("next_slot_hidden", out.get("slot_hidden", None))
+        next_bev = out.get("next_bev_hidden", out.get("bev_hidden", None))
+
+        # If forward returned time-major sequence for hidden, take the last timestep
+        if isinstance(next_slot, torch.Tensor):
+            # possible shapes: [T,B,N,H] or [1,B,N,H] or [B,N,H]
+            if next_slot.ndim == 4:
+                # assume time-major -> take last
+                next_slot = next_slot[-1]
+            # ensure shape [B,N,H]
+            if next_slot.ndim != 3:
+                raise RuntimeError(f"burn_in: unexpected slot hidden shape {next_slot.shape}")
+
+        if isinstance(next_bev, torch.Tensor):
+            # possible shapes: [T,B,D] or [1,B,D] or [B,D]
+            if next_bev.ndim == 3:
+                next_bev = next_bev[-1]
+            # allow [B,D] or None
+
+        if detach:
+            if isinstance(next_slot, torch.Tensor):
+                next_slot = next_slot.detach()
+            if isinstance(next_bev, torch.Tensor):
+                next_bev = next_bev.detach()
+
+        # ensure device consistency
+        if isinstance(next_slot, torch.Tensor):
+            next_slot = next_slot.to(self.device)
+        if isinstance(next_bev, torch.Tensor):
+            next_bev = next_bev.to(self.device)
+
+        return next_slot, next_bev
+
     def select_action(self,
                       obs_step: Dict[str, torch.Tensor],
                       slot_hidden: Optional[torch.Tensor] = None,
@@ -461,40 +541,15 @@ class MAPPOPolicy(nn.Module):
         """
         Single-step sampling wrapper that reuses forward(..., mode='step').
 
-        Inputs:
-          - obs_step: dict with keys "image" [B,C,H,W] and "agent_feats" [B,N,obs_dim] (torch.Tensor)
-          - slot_hidden: [B,N,H] or None
-          - bev_hidden: whatever shape your forward expects or None
-          - mask: [B,N] or None
-          - deterministic: if True use mu (no sampling)
-
-        Returns tuple:
-          (actions, values, log_probs, next_slot_hidden, next_bev_hidden, info)
-        where:
-          - actions: torch.Tensor [B,N,act_dim] (tanh-squashed as forward returns)
-          - values: torch.Tensor [B,N,1]
-          - log_probs: torch.Tensor [B,N]
-          - next_slot_hidden: torch.Tensor [B,N,H]
-          - next_bev_hidden: torch.Tensor (shape per your forward)
-          - info: dict with optional keys 'mu','log_std','pre_tanh' (all tensors)
+        Returns:
+          actions: torch.Tensor [B,N,2]  (throttle, steer)
+          values:  torch.Tensor [B,N,1]
+          log_probs: torch.Tensor [B,N]
+          next_slot_hidden: torch.Tensor [B,N,H] or None
+          next_bev_hidden: torch.Tensor or None
+          info: dict (mu, log_std, pre_tanh)
         """
-        # Ensure inputs are tensors on a device
-        device = None
-        if "agent_feats" in obs_step and torch.is_tensor(obs_step["agent_feats"]):
-            device = obs_step["agent_feats"].device
-        elif "image" in obs_step and torch.is_tensor(obs_step["image"]):
-            device = obs_step["image"].device
-
-        # If mask is None, build an all-ones mask matching B,N
-        if mask is None:
-            if "agent_feats" in obs_step and torch.is_tensor(obs_step["agent_feats"]):
-                B = obs_step["agent_feats"].shape[0]
-                N = obs_step["agent_feats"].shape[1]
-                mask = torch.ones(B, N, device=device)
-            else:
-                mask = None
-
-        # Call forward in step mode under no_grad for efficiency
+        # call forward in step mode (no grad)
         with torch.no_grad():
             out = self.forward(obs=obs_step,
                                slot_hidden=slot_hidden,
@@ -503,37 +558,46 @@ class MAPPOPolicy(nn.Module):
                                mode="step",
                                deterministic=deterministic)
 
-        # forward (as written) returns keys: "actions","values","log_probs",
-        # "next_slot_hidden","next_bev_hidden","mu","log_std","pre_tanh"
-        # be robust to slight key-name differences
-        actions = out.get("actions", out.get("action", None))
-        values = out.get("values", out.get("value", None))
-        log_probs = out.get("log_probs", out.get("logp", None))
+        # get commonly returned items
+        mu = out.get("mu")  # expected shape [B,N,A_net]
+        log_std = out.get("log_std")  # [B,N,A_net]
+        values = out.get("values", out.get("value"))  # [B,N,1] or [B,N]
         next_slot_hidden = out.get("next_slot_hidden", out.get("slot_hidden", None))
         next_bev_hidden = out.get("next_bev_hidden", out.get("bev_hidden", None))
 
-        # collect info dict first
         info = {
-            "mu": out.get("mu", None),
-            "log_std": out.get("log_std", None),
-            "pre_tanh": out.get("pre_tanh", None)
+            "mu": mu,
+            "log_std": log_std,
+            "pre_tanh": None
         }
 
-        # ensure info tensors are on caller device for safe buffer storage
-        for k in ("mu", "log_std", "pre_tanh"):
-            if info.get(k) is not None and device is not None:
-                info[k] = info[k].to(device)
+        # minimal required: mu and log_std must exist
+        std = torch.exp(log_std)
 
-        # Minimal sanity checks (only in debug; remove or guard in production)
-        # make sure tensors are on the same device
-        if actions is not None and device is not None:
-            actions = actions.to(device)
-        if values is not None and device is not None:
-            values = values.to(device)
-        if log_probs is not None and device is not None:
-            log_probs = log_probs.to(device)
+        # sampling or deterministic
+        if deterministic:
+            pre_t = mu
+        else:
+            eps = torch.randn_like(mu)
+            pre_t = mu + eps * std
 
-        return actions, values, log_probs, next_slot_hidden, next_bev_hidden, info
+        # log-prob without tanh-correction (simple)
+        dist = torch.distributions.Normal(mu, std)
+        logp = dist.log_prob(pre_t).sum(dim=-1)  # [B,N]
+
+        # squash to (-1,1)
+        pre_t_squashed = torch.tanh(pre_t)
+        info["pre_tanh"] = pre_t_squashed
+
+        # only keep first two dims: throttle, steer
+        a_trim = pre_t_squashed[..., :2]  # [B,N,2]
+
+        # map throttle (-1,1) -> (0,1), steer keep (-1,1)
+        throttle = (a_trim[..., 0] + 1.0) / 2.0
+        steer = a_trim[..., 1]
+        actions = torch.stack([throttle, steer], dim=-1)  # [B,N,2]
+
+        return actions, values, logp, next_slot_hidden, next_bev_hidden, info
 
     def get_initial_hidden(self, batch_size: int, n_agent: int,
                            randomize: bool = False, eps: float = 1e-3):
@@ -758,82 +822,81 @@ class MAPPOPolicy(nn.Module):
 
         return bev_embed, next_bev_h
 
-    def _call_slot_gru_step(self, feat_t, slot_h, bev_embed, mask_t, type_t=None):
-        """
-        feat_t: [B, N, obs_dim]
-        slot_h: [B, N, H] previous hidden
-        bev_embed: [B, D]  (or [B, N, D] possibly)
-        mask_t: [B, N] mask (0/1)
-        type_t: [B, N] int type ids or None
+    def _call_slot_gru_step(self, feat_t, slot_h, bev_embed, mask_t):
+        import torch
 
-        Returns:
-          slot_emb: [B, N, H]  (new per-agent embedding)
-          next_slot_h: [B, N, H] updated hidden (same as slot_emb if GRUCell-style)
-        """
-        B, N, _ = feat_t.shape
-        device = feat_t.device
+        dev = next(self.parameters()).device
 
-        # 1) prepare bev per-agent
+        if not isinstance(feat_t, torch.Tensor):
+            feat_t = torch.as_tensor(feat_t, dtype=torch.float32, device=dev)
+        feat_t = feat_t.to(dev)
+        if feat_t.dim() != 3:
+            raise RuntimeError(f"feat_t must be [B,N,F], got {tuple(feat_t.shape)}")
+        B, N, F_feat = feat_t.shape
+
         if bev_embed is None:
-            bev_per_agent = torch.zeros(B, N, getattr(self, "bev_feat_dim", 256), device=device)
-        else:
-            # bev_embed often [B, D]; broadcast to [B, N, D]
-            if bev_embed.dim() == 2 and bev_embed.shape[0] == B:
-                bev_per_agent = bev_embed.unsqueeze(1).expand(-1, N, -1)
-            elif bev_embed.dim() == 3 and bev_embed.shape[:2] == (B, N):
-                bev_per_agent = bev_embed
-            else:
-                # unknown shape -> try safe broadcast
-                bev_per_agent = bev_embed.reshape(B, 1, -1).expand(-1, N, -1)
-
-        # 2) type embedding (optional)
-        if type_t is not None and hasattr(self, "type_emb"):
-            # type_t: [B,N] -> embed -> [B,N,type_emb_dim]
-            type_emb = self.type_emb(type_t.long())
-        else:
-            type_emb = torch.zeros(B, N, getattr(self, "type_emb_dim", 0), device=device)
-
-        # 3) build slot input: concat numeric feats + bev_per_agent + type_emb
-        slot_input = torch.cat([feat_t, bev_per_agent, type_emb], dim=-1)  # [B,N, input_dim]
-
-        # 4) call slot_gru (some implementations accept batch of slots flattened)
-        if self.slot_gru is None:
-            # no slot GRU configured -> project slot_input to recurrent_hidden_dim via a linear
-            proj = getattr(self, "_slot_fallback_proj", None)
-            if proj is None:
-                in_dim = slot_input.shape[-1]
-                H = self.recurrent_hidden_dim
-                self._slot_fallback_proj = nn.Linear(in_dim, H).to(device)
-                proj = self._slot_fallback_proj
-            # flatten B,N -> [B*N, in_dim] for linear, then reshape
-            flat = slot_input.view(B * N, -1)
-            out = proj(flat).view(B, N, -1)
-            # treat out as both slot_emb and next_slot_h
-            slot_emb = out
-            next_slot_h = out
-        else:
-            # SlotGRU may have either .step or .forward that accept (slot_input, slot_h, mask)
-            if hasattr(self.slot_gru, "step"):
-                slot_emb, next_slot_h = self.slot_gru.step(slot_input, slot_h, bev_per_agent, mask_t)
-            else:
-                # try forward: many GRUCell wrappers accept flattened input
-                # flatten inputs to [B*N, ...]
-                flat_in = slot_input.view(B * N, -1)
-                flat_h = slot_h.view(B * N, -1)
-                flat_out = self.slot_gru(flat_in, flat_h)  # expect [B*N, H] or (out, next_h)
-                if isinstance(flat_out, tuple):
-                    flat_emb, flat_next = flat_out
+            raise RuntimeError("bev_embed cannot be None")
+        if not isinstance(bev_embed, torch.Tensor):
+            bev_embed = torch.as_tensor(bev_embed, dtype=torch.float32, device=dev)
+        bev_embed = bev_embed.to(dev)
+        if bev_embed.dim() == 2:
+            if bev_embed.shape[0] != B:
+                # try to handle case where bev_embed rows == B*N
+                if bev_embed.shape[0] == B * N:
+                    bev_embed = bev_embed.view(B, N, bev_embed.shape[1])
                 else:
-                    flat_emb = flat_out
-                    flat_next = flat_out
-                slot_emb = flat_emb.view(B, N, -1)
-                next_slot_h = flat_next.view(B, N, -1)
+                    raise RuntimeError(f"bev_embed batch mismatch {tuple(bev_embed.shape)} vs B={B}")
+            bev_embed = bev_embed.unsqueeze(1).expand(B, N, -1).contiguous()
+        elif bev_embed.dim() == 3:
+            if tuple(bev_embed.shape[:2]) != (B, N):
+                if bev_embed.shape[0] * bev_embed.shape[1] == B * N:
+                    bev_embed = bev_embed.view(B, N, bev_embed.shape[2])
+                else:
+                    raise RuntimeError(f"bev_embed shape mismatch {tuple(bev_embed.shape)} vs expected (B,N)=({B},{N})")
+        else:
+            raise RuntimeError(f"bev_embed must be [B,F] or [B,N,F], got {tuple(bev_embed.shape)}")
+        F_bev = bev_embed.shape[2]
 
-        # 5) apply mask: keep previous hidden where mask==0 (agent inactive)
-        if mask_t is not None:
-            m = mask_t.float().unsqueeze(-1)  # [B,N,1]
-            next_slot_h = next_slot_h * m + slot_h * (1.0 - m)
-            slot_emb = slot_emb * m + slot_h * (1.0 - m)
+        if mask_t is None:
+            mask_t = torch.ones(B, N, device=dev)
+        if not isinstance(mask_t, torch.Tensor):
+            mask_t = torch.as_tensor(mask_t, dtype=torch.bool, device=dev)
+        mask_t = mask_t.to(dev)
+        if mask_t.dim() == 1 and mask_t.shape[0] == B * N:
+            mask_t = mask_t.view(B, N)
+        if mask_t.dim() != 2:
+            raise RuntimeError(f"mask_t must be [B,N], got {tuple(mask_t.shape)}")
+
+        pieces = [feat_t.reshape(B * N, F_feat), bev_embed.reshape(B * N, F_bev)]
+
+        slot_input = torch.cat(pieces, dim=-1)  # [B*N, total_dim]
+        total_dim = slot_input.shape[1]
+
+        expected_in = None
+        # try to obtain expected input size from slot_gru
+        try:
+            expected_in = int(
+                getattr(self.slot_gru, "input_size", None) or getattr(self.slot_gru, "gru_cell").input_size)
+        except Exception:
+            expected_in = None
+
+        if expected_in is not None:
+            if total_dim < expected_in:
+                pad_dim = expected_in - total_dim
+                pad = torch.zeros(B * N, pad_dim, device=dev, dtype=slot_input.dtype)
+                slot_input = torch.cat([slot_input, pad], dim=-1)
+                total_dim = expected_in
+            elif total_dim > expected_in:
+                raise RuntimeError(
+                    f"[slot_gru] input mismatch: total_dim={total_dim} > expected_in={expected_in}; "
+                    f"feat_t={tuple(feat_t.shape)}, bev_embed={tuple(bev_embed.shape)}, mask_t={tuple(mask_t.shape)}"
+                )
+
+        slot_emb, next_slot_h = self.slot_gru.step(slot_input, slot_h, mask_t)
+
+        if isinstance(slot_emb, torch.Tensor) and slot_emb.dim() == 2:
+            H = slot_emb.shape[1]
+            slot_emb = slot_emb.view(B, N, H)
 
         return slot_emb, next_slot_h
 
@@ -843,24 +906,29 @@ class MAPPOPolicy(nn.Module):
         type_t: optional [B, N] type ids
 
         Returns:
-          mu: [B, N, A]  (A depends on type -> we will return max_act_dim padded if necessary)
+          mu: [B, N, A]
           log_std: [B, N, A]
         """
+        import torch
+
         B, N, H = slot_emb.shape
         device = slot_emb.device
 
-        # ActorHeads in your init likely expects per-agent flattened input [B*N, H]
-        flat = slot_emb.view(B * N, H)
-        # some ActorHeads accept (flat, type_flat) or just flat and internally handle type
+        # flattened per-agent features (B*N, H)
+        flat = slot_emb.contiguous().view(B * N, H)
+
+        # 1) Call actor with preferred signature(s)
         if type_t is not None:
-            type_flat = type_t.view(B * N)
+            # prefer (slot_emb, type_t) signature
             try:
-                out = self.actor(flat, type_flat)  # expect (mu_flat, log_std_flat) or mu only
+                out = self.actor(slot_emb, type_t)
             except TypeError:
-                # actor may expect full [B,N,H] and type [B,N]
+                # fallback to (flat, type_flat)
                 try:
-                    out = self.actor(slot_emb, type_t)
+                    type_flat = type_t.contiguous().view(B * N)
+                    out = self.actor(flat, type_flat)
                 except Exception:
+                    # ultimate fallback: actor(flat)
                     out = self.actor(flat)
         else:
             try:
@@ -868,22 +936,147 @@ class MAPPOPolicy(nn.Module):
             except Exception:
                 out = self.actor(slot_emb)
 
-        # normalize outputs to (mu, log_std) flat or per-agent shapes
-        if isinstance(out, tuple) and len(out) == 2:
-            mu_flat, log_std_flat = out
-        else:
-            mu_flat = out
-            # try to read learnable log std param from actor if present
-            if hasattr(self.actor, "log_std"):
-                log_std_flat = self.actor.log_std.expand_as(mu_flat)
-            else:
-                # fallback small constant
-                A = mu_flat.shape[-1]
-                log_std_flat = torch.full_like(mu_flat, fill_value=self.log_std_init)
+        # 2) Normalize actor output into mu_flat and log_std_flat tensors
+        mu_flat = None
+        log_std_flat = None
 
-        # reshape to [B,N,A]
-        mu = mu_flat.view(B, N, -1)
-        log_std = log_std_flat.view(B, N, -1)
+        # tuple / list => (mu, log_std?) or single mu
+        if isinstance(out, (tuple, list)):
+            if len(out) >= 2:
+                mu_flat, log_std_flat = out[0], out[1]
+            elif len(out) == 1:
+                mu_flat = out[0]
+        # dict => try common keys
+        elif isinstance(out, dict):
+            # look for mean keys
+            for k in ("mu", "mean", "loc", "action", "mu_flat"):
+                if k in out:
+                    mu_flat = out[k]
+                    break
+            # fallback: take first tensor value
+            if mu_flat is None:
+                for v in out.values():
+                    if torch.is_tensor(v):
+                        mu_flat = v
+                        break
+            # log_std / std keys
+            if "log_std" in out:
+                log_std_flat = out["log_std"]
+            elif "logvar" in out:
+                # if logvar provided, convert to log_std = 0.5 * logvar
+                lv = out["logvar"]
+                if torch.is_tensor(lv):
+                    log_std_flat = 0.5 * lv
+            elif "std" in out:
+                stdv = out["std"]
+                if torch.is_tensor(stdv):
+                    log_std_flat = torch.log(stdv.clamp(min=1e-12))
+        # tensor => treat as mu
+        elif torch.is_tensor(out):
+            mu_flat = out
+        else:
+            # last resort: try to convert to tensor
+            try:
+                mu_flat = torch.as_tensor(out, device=device)
+            except Exception:
+                raise RuntimeError(f"Unsupported actor output type: {type(out)}")
+
+        # ensure mu_flat is a tensor
+        if mu_flat is None or not torch.is_tensor(mu_flat):
+            # helpful debug info
+            if isinstance(out, dict):
+                keys = list(out.keys())
+            else:
+                keys = None
+            raise RuntimeError(f"actor returned unsupported output (no mean found). out_type={type(out)}, keys={keys}")
+
+        # 3) Normalize shapes:
+        # mu_flat may be either:
+        #  - [B, N, A]  (3D) -> flatten to [B*N, A]
+        #  - [B*N, A]   (2D) -> ok
+        #  - [S, A]     (2D) where S == B*N -> ok
+        # Do conversions accordingly and keep A.
+        if mu_flat.dim() == 3:
+            b_, n_, A = mu_flat.size()
+            if b_ != B or n_ != N:
+                # try to handle swapped dims if bizarre, but prefer raising
+                raise RuntimeError(
+                    f"actor returned mu with shape {tuple(mu_flat.size())} inconsistent with expected (B,N,*)=({B},{N},*)")
+            mu_flat = mu_flat.contiguous().view(B * N, A)
+        elif mu_flat.dim() == 2:
+            A = mu_flat.size(-1)
+            # assume already flat [B*N, A] or [S, A] where S == B*N
+            if mu_flat.size(0) != B * N:
+                # if shapes mismatch, but equals B or N maybe actor returned [B, A] or [N, A]
+                if mu_flat.size(0) == B:
+                    # [B, A] -> expand across N agents? This is ambiguous; raise to enforce strictness
+                    raise RuntimeError(
+                        f"actor returned mu of shape [B, A] ({tuple(mu_flat.size())}) — ambiguous for per-agent output. Expected [B*N, A].")
+                elif mu_flat.size(0) == N:
+                    raise RuntimeError(
+                        f"actor returned mu of shape [N, A] ({tuple(mu_flat.size())}) — ambiguous for batch handling. Expected [B*N, A].")
+                else:
+                    raise RuntimeError(
+                        f"actor returned mu with unexpected first dim {mu_flat.size(0)}; expected {B * N}")
+        else:
+            raise RuntimeError(f"actor returned mu with unsupported dim {mu_flat.dim()} (expected 2 or 3)")
+
+        # 4) Normalize log_std_flat
+        if log_std_flat is None:
+            # if actor has learnable log_std param, try to use it
+            if hasattr(self.actor, "log_std"):
+                # actor.log_std might be shape [A] or [1, A] or [B*N, A]
+                ls = self.actor.log_std
+                if torch.is_tensor(ls):
+                    # expand to [B*N, A] if needed
+                    if ls.dim() == 1:
+                        log_std_flat = ls.unsqueeze(0).expand(B * N, -1).to(device)
+                    elif ls.dim() == 2 and ls.size(0) == 1:
+                        log_std_flat = ls.expand(B * N, -1).to(device)
+                    elif ls.dim() == 2 and ls.size(0) == B * N:
+                        log_std_flat = ls.to(device)
+                    else:
+                        # fallback: flatten and expand
+                        log_std_flat = ls.view(-1).unsqueeze(0).expand(B * N, -1).to(device)
+                else:
+                    # not tensor, coerce
+                    log_std_flat = torch.as_tensor(float(self.log_std_init), device=device).unsqueeze(0).expand(B * N,
+                                                                                                                1)
+            else:
+                # use configured init value
+                log_std_flat = torch.full((B * N, A), fill_value=float(getattr(self, "log_std_init", 0.0)),
+                                          device=device)
+        else:
+            # if provided, coerce to tensor and normalize dims
+            if not torch.is_tensor(log_std_flat):
+                log_std_flat = torch.as_tensor(log_std_flat, device=device)
+            if log_std_flat.dim() == 3:
+                b_, n_, _ = log_std_flat.size()
+                if b_ != B or n_ != N:
+                    raise RuntimeError(
+                        f"actor returned log_std with shape {tuple(log_std_flat.size())} inconsistent with expected (B,N,*)")
+                log_std_flat = log_std_flat.contiguous().view(B * N, -1)
+            elif log_std_flat.dim() == 2:
+                # OK if matches [B*N, A] or [B*N, 1] (will broadcast later)
+                if log_std_flat.size(0) != B * N:
+                    # if it's [B, A] or [1, A], try to match strictly only when unambiguous
+                    if log_std_flat.size(0) == B and log_std_flat.size(1) == A:
+                        raise RuntimeError(
+                            "actor returned log_std shaped [B,A] which is ambiguous; prefer [B*N,A] or [1,A]")
+                    elif log_std_flat.size(0) == 1 and log_std_flat.size(1) == A:
+                        log_std_flat = log_std_flat.expand(B * N, -1)
+                    else:
+                        raise RuntimeError(
+                            f"actor returned log_std with unexpected first dim {log_std_flat.size(0)}; expected {B * N}")
+            elif log_std_flat.dim() == 1:
+                # [A] -> expand
+                log_std_flat = log_std_flat.view(1, -1).expand(B * N, -1)
+            else:
+                raise RuntimeError(f"actor returned log_std with unsupported dim {log_std_flat.dim()}")
+
+        # 5) Final reshape to [B, N, A]
+        mu = mu_flat.view(B, N, A)
+        log_std = log_std_flat.view(B, N, A)
 
         return mu, log_std
 
@@ -979,8 +1172,323 @@ class MAPPOPolicy(nn.Module):
 
         return v
 
-    # def get_initial_hidden(self, batch_size, n_agent):
-    #     device = self.device
-    #     slot_h = torch.zeros(batch_size, n_agent, self.recurrent_hidden_dim, device=device)
-    #     bev_h = torch.zeros(batch_size, self.bev_feat_dim, device=device)
-    #     return slot_h, bev_h
+    def mappo_reset(self, init_obs: Optional[dict] = None):
+        """
+        Reset per-policy runtime state called by MAPPOManager after env.reset().
+
+        Behavior:
+          - clear runtime hidden/caches to avoid stale references across episodes
+          - if init_obs provided and contains tensor 'agent_feats', infer (B, N)
+            and create initial hidden via get_initial_hidden() storing them on the policy.
+
+        Notes:
+          - Manager typically calls this on each agent; returning a value is optional.
+          - We store *_runtime_* attributes as placeholders; trainer/manager may choose to read them.
+        """
+        # 1) clear runtime placeholders / caches
+        self._runtime_slot_hidden = None
+        self._runtime_bev_hidden = None
+
+        # 2) if init_obs is a dict and contains agent_feats (torch.Tensor), create initial hidden
+        try:
+            if isinstance(init_obs, dict):
+                af = init_obs.get("agent_feats", None)
+                # accept a single-step [B,N,obs] or stepless [N,obs] or numpy arrays
+                if af is not None:
+                    # convert numpy -> torch if needed (non-destructive)
+                    if not torch.is_tensor(af):
+                        try:
+                            import numpy as _np
+                            if isinstance(af, _np.ndarray):
+                                af = torch.from_numpy(af)
+                        except Exception:
+                            af = None
+
+                    if torch.is_tensor(af):
+                        # possible shapes: [B,N,obs], [N,obs], [B,obs] etc.
+                        if af.dim() == 3:
+                            B, N, _ = af.shape
+                        elif af.dim() == 2:
+                            # ambiguous: treat as [1, N, obs] if first dim equals N else [B, N] fallback
+                            # we assume [N, obs] -> single batch
+                            N = af.shape[0]
+                            B = 1
+                        else:
+                            # fallback: can't infer
+                            B = None
+                            N = None
+
+                        if B is not None and N is not None:
+                            slot_h, bev_h = self.get_initial_hidden(batch_size=B, n_agent=N)
+                            # store as runtime defaults (trainer/manager can read them)
+                            self._runtime_slot_hidden = slot_h
+                            self._runtime_bev_hidden = bev_h
+        except Exception:
+            # don't raise: reset should be lightweight and robust
+            self._runtime_slot_hidden = None
+            self._runtime_bev_hidden = None
+
+        # 3) Also clear any other potential runtime attrs if present
+        for attr in ("_last_obs", "_running_mean", "_some_temp_buffer"):
+            if hasattr(self, attr):
+                try:
+                    setattr(self, attr, None)
+                except Exception:
+                    pass
+
+        return None
+
+    def evaluate_actions(self, obs, actions, *args, **kwargs):
+        """
+        Clean and stable evaluate_actions:
+        - obs MUST be a dict containing at least {'agent_feats': [B,N,F], 'image': [B,C,H,W]}
+        - actions: [B,N,A]
+        - returns a dict with keys: 'log_probs', 'values'
+        """
+
+        import torch
+        import traceback
+
+        device = next(self.parameters()).device
+
+        # -----------------------
+        # validate obs
+        # -----------------------
+        if not isinstance(obs, dict):
+            raise RuntimeError("evaluate_actions: obs must be dict")
+
+        if "agent_feats" not in obs or "image" not in obs:
+            raise RuntimeError("evaluate_actions: obs missing required keys")
+
+        agent_feats = obs["agent_feats"]
+        image = obs["image"]
+        type_id = obs.get("type_id", None)
+
+        if not isinstance(agent_feats, torch.Tensor):
+            agent_feats = torch.tensor(agent_feats, dtype=torch.float32)
+        if not isinstance(image, torch.Tensor):
+            image = torch.tensor(image, dtype=torch.float32)
+        if isinstance(type_id, list):
+            type_id = torch.tensor(type_id, dtype=torch.long)
+
+        agent_feats = agent_feats.to(device)
+        image = image.to(device)
+        if type_id is not None:
+            type_id = type_id.to(device)
+
+        obs = {"agent_feats": agent_feats, "image": image}
+        if type_id is not None:
+            obs["type_id"] = type_id
+
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.tensor(actions, dtype=torch.float32)
+        actions = actions.to(device)
+
+        # -----------------------
+        # forward pass (no grad)
+        # -----------------------
+        with torch.no_grad():
+            out = self.forward(obs=obs, mode="step", deterministic=False)
+
+        if not isinstance(out, dict):
+            raise RuntimeError("evaluate_actions: forward returned non-dict")
+
+        logp = out.get("log_probs", None)
+        value = out.get("values", None)
+
+        if logp is None or value is None:
+            raise RuntimeError(f"evaluate_actions: missing keys in output {out.keys()}")
+
+        return {"log_probs": logp, "values": value}
+
+    def compute_slot_features(self, agent_feats):
+        """
+        Robust slot feature computation.
+
+        Input:
+          agent_feats: tensor in shape [B, N, F] OR [B*N, F] OR [B, F] (interpreted as N=1)
+        Output:
+          slot_emb: tensor [B, N, E] (E = self.slot_emb_dim or fallback 128)
+        Behavior:
+          - Will try to use self.slot_mlp / self.slot_encoder if present.
+          - Otherwise create a lightweight fallback MLP stored as self._slot_mlp.
+        """
+        if agent_feats is None:
+            raise ValueError("compute_slot_features: agent_feats is None")
+
+        # ensure tensor
+        if not torch.is_tensor(agent_feats):
+            agent_feats = torch.as_tensor(agent_feats)
+
+        # infer shapes
+        if agent_feats.dim() == 3:
+            B, N, F = agent_feats.shape
+            flat = False
+            flat_feats = agent_feats.view(B * N, F)
+        elif agent_feats.dim() == 2:
+            # could be [B*N, F] or [B, F] (N==1)
+            # try to guess: if self has known slot count, use it; else assume N==1
+            F = agent_feats.shape[1]
+            guessed_N = getattr(self, "slot_count", None) or getattr(self, "num_agents", None) or getattr(self, "N",
+                                                                                                          None)
+            if guessed_N and agent_feats.shape[0] % guessed_N == 0:
+                B = agent_feats.shape[0] // guessed_N
+                N = guessed_N
+                flat = True
+                flat_feats = agent_feats.view(B * N, F)
+            else:
+                # treat as [B, F] => single slot
+                B = agent_feats.shape[0]
+                N = 1
+                flat = False
+                flat_feats = agent_feats.view(B * N, F)
+                agent_feats = flat_feats.view(B, N, F)
+        else:
+            raise RuntimeError(f"compute_slot_features: unsupported agent_feats dim {agent_feats.dim()}")
+
+        device = agent_feats.device
+
+        # determine embedding dim
+        slot_emb_dim = getattr(self, "slot_emb_dim", None)
+        if slot_emb_dim is None:
+            # try common names
+            slot_emb_dim = getattr(self, "slot_h_dim", None) or getattr(self, "slot_hidden_dim", None) or 128
+        slot_emb_dim = int(slot_emb_dim)
+
+        # try to use existing encoder if available
+        encoder = None
+        for cand in ("slot_mlp", "slot_encoder", "slot_proj", "slot_net"):
+            if hasattr(self, cand):
+                encoder = getattr(self, cand)
+                break
+
+        # If no encoder module, create a fallback and attach to self (so parameters persist)
+        if encoder is None:
+            if not hasattr(self, "_slot_mlp"):
+                # small MLP fallback
+                in_dim = int(flat_feats.shape[1])
+                hidden = max(64, min(256, in_dim * 2))
+                mlp = nn.Sequential(
+                    nn.Linear(in_dim, hidden),
+                    nn.ReLU(),
+                    nn.Linear(hidden, slot_emb_dim)
+                )
+                # move to correct device and dtype
+                mlp.to(device)
+                self._slot_mlp = mlp
+            encoder = getattr(self, "_slot_mlp")
+
+        # If encoder expects [B,N,F] vs [B*N, F] - handle both
+        try:
+            # preferred: pass flat_feats [B*N, F]
+            slot_emb_flat = encoder(flat_feats)
+            # ensure it's a tensor
+            if not torch.is_tensor(slot_emb_flat):
+                slot_emb_flat = torch.as_tensor(slot_emb_flat, device=device)
+        except Exception:
+            # try passing [B, N, F] if encoder can accept 3D
+            try:
+                slot_emb = encoder(agent_feats)  # expect [B,N,E]
+                if slot_emb.dim() == 2 and slot_emb.shape[0] == B * N:
+                    slot_emb = slot_emb.view(B, N, -1)
+                elif slot_emb.dim() == 3 and slot_emb.shape[0] == B and slot_emb.shape[1] == N:
+                    pass
+                else:
+                    # try to flatten and re-run
+                    flat_feats2 = agent_feats.view(B * N, agent_feats.shape[-1])
+                    slot_emb_flat = encoder(flat_feats2)
+                    if slot_emb_flat.dim() == 2:
+                        slot_emb = slot_emb_flat.view(B, N, -1)
+                    else:
+                        # last resort: try squeeze/reshape
+                        slot_emb = slot_emb
+            except Exception as e:
+                # propagate informative error
+                raise RuntimeError(f"compute_slot_features failed to run encoder: {e}")
+
+        # if we got flat result, reshape to [B,N,E]
+        if 'slot_emb_flat' in locals():
+            se = slot_emb_flat
+            if se.dim() == 2 and se.shape[0] == B * N:
+                slot_emb = se.view(B, N, se.shape[1])
+            elif se.dim() == 3 and se.shape[0] == B and se.shape[1] == N:
+                slot_emb = se
+            else:
+                # try to coerce
+                try:
+                    slot_emb = se.view(B, N, -1)
+                except Exception:
+                    raise RuntimeError(f"compute_slot_features: unexpected encoder output shape {tuple(se.shape)}")
+        # ensure final shape
+        if slot_emb.dim() != 3:
+            raise RuntimeError(f"compute_slot_features: final slot_emb dim unexpected {slot_emb.dim()}")
+
+        return slot_emb
+
+    def _actor_head_fallback(self, slot_emb):
+        """
+        Produce (mu, log_std) from slot_emb.
+        slot_emb: [B, N, E] or [B*N, E]
+        returns mu, log_std both shaped [B, N, A]
+        """
+        if slot_emb.dim() == 3:
+            B, N, E = slot_emb.shape
+            flat = False
+            flat_in = slot_emb.view(B * N, E)
+        elif slot_emb.dim() == 2:
+            flat_in = slot_emb
+            B = None;
+            N = None
+        else:
+            raise RuntimeError("actor_head_fallback: unsupported slot_emb dim")
+
+        # get action dim if known
+        A = getattr(self, "action_dim", None) or getattr(self, "act_dim", None) or 2
+        A = int(A)
+
+        # create fallback heads if missing
+        if not hasattr(self, "_actor_mu_head"):
+            hidden = max(64, min(256, flat_in.shape[1] * 2))
+            self._actor_mu_head = nn.Sequential(nn.Linear(flat_in.shape[1], hidden), nn.ReLU(), nn.Linear(hidden, A))
+            # logstd head
+            self._actor_logstd = nn.Parameter(torch.zeros((1, A), device=flat_in.device))
+        mu_flat = self._actor_mu_head(flat_in)  # [B*N, A] or [B, A]
+        # broadcast logstd
+        logstd = self._actor_logstd.expand(mu_flat.shape[0], -1)
+
+        if slot_emb.dim() == 3:
+            mu = mu_flat.view(B, N, A)
+            log_std = logstd.view(B, N, A)
+        else:
+            mu = mu_flat
+            log_std = logstd
+        return mu, log_std
+
+    def _critic_head_fallback(self, slot_emb):
+        """
+        Produce values [B,N] (or [B*N] flattened) from slot_emb.
+        """
+        if slot_emb.dim() == 3:
+            B, N, E = slot_emb.shape
+            flat = True
+            flat_in = slot_emb.view(B * N, E)
+        elif slot_emb.dim() == 2:
+            flat_in = slot_emb
+        else:
+            raise RuntimeError("critic_head_fallback: unsupported slot_emb dim")
+
+        if not hasattr(self, "_critic_head_fc"):
+            hidden = max(64, min(256, flat_in.shape[1] * 2))
+            self._critic_head_fc = nn.Sequential(nn.Linear(flat_in.shape[1], hidden), nn.ReLU(), nn.Linear(hidden, 1))
+            self._critic_head_fc.to(flat_in.device)
+
+        v_flat = self._critic_head_fc(flat_in)  # [B*N, 1] or [B,1]
+        # reshape back
+        if slot_emb.dim() == 3:
+            values = v_flat.view(B, N)
+        else:
+            values = v_flat.squeeze(-1)
+        return values
+
+
+

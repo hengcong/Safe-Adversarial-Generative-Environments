@@ -1,0 +1,30 @@
+{
+  "exp_name": "sage_mappo",
+  "seed": 12345,
+  "device": "cuda",
+  "num_envs": 1,
+  "num_steps": 512,
+  "total_updates": 10000,
+  "log_interval": 1,
+  "checkpoint_every": 50,
+  "save_dir": "./runs",
+  "algo": {
+    "lr": 0.0003,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "norm_adv": true,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "update_epochs": 10,
+    "minibatch_size": 64
+  },
+  "env": {
+    "num_vehicles": 30,
+    "num_pedestrians": 10,
+    "tm_port": 8000,
+    "max_slots": 16
+  },
+  "use_wandb": false,
+  "wandb_project": "sage-mappo"
+}
