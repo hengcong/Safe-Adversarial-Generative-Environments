@@ -31,8 +31,8 @@ def policy_ctor_from_spec(spec):
         use_bev_gru=spec.get("use_bev_gru", True),
         use_slot_gru=spec.get("use_slot_gru", True),
         global_ctx_dim=spec.get("global_ctx_dim", 256),
-        action_scale=spec.get("action_scale", 1.0),
-        log_std_init=spec.get("log_std_init", -0.5),
+        action_scale=spec.get("action_scale", 5.0),
+        log_std_init=spec.get("log_std_init", 0.0),
         device=spec.get("device", "cpu"),
     )
 
@@ -50,8 +50,8 @@ def save_checkpoint(manager, out_dir, step):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--device", default="cpu")
-    p.add_argument("--num_steps", type=int, default=128, help="rollout length (T)")
-    p.add_argument("--num_iters", type=int, default=10000, help="training iterations")
+    p.add_argument("--num_steps", type=int, default=256, help="rollout length (T)")
+    p.add_argument("--num_iters", type=int, default=200000, help="training iterations")
     p.add_argument("--save_every", type=int, default=200, help="save checkpoint every N iters")
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--out_dir", default="checkpoints")
@@ -282,27 +282,45 @@ def debug_policy_and_batch_shapes(manager, sample_batch=None, try_resolves: bool
             print(tb)
             return None
 
-    print("[debug] starting forward/evaluate attempts...")
-    # a) evaluate_actions(agent_feats, actions)
+    print("[debug] starting forward/evaluate attempts with RNN states...")
+
+    # Get RNN initial states and pre_t from batch
+    init_slot = batch.get("init_slot_hidden", None)
+    init_bev = batch.get("init_bev_hidden", None)
+    pre_t = batch.get("pre_t", None)
+
+    # a) evaluate_actions(obs, actions, ...)
     if hasattr(manager.policy, "evaluate_actions"):
         candidate_af = obs.get("agent_feats", None)
-        out = try_call("evaluate_actions(agent_feats_pos, actions_pos)",
+
+        # Attempt 1: Full call with RNN states and pre_t (New standard)
+        out = try_call("evaluate_actions(obs, actions, hidden, pre_t)",
                        manager.policy.evaluate_actions,
-                       candidate_af, batch.get("actions", None))
+                       obs,
+                       batch.get("actions", None),
+                       slot_hidden=init_slot,
+                       bev_hidden=init_bev,
+                       pre_t=pre_t)
         if out is not None:
-            print("=== debug_policy_and_batch_shapes END ===\n")
+            print("=== debug_policy_and_batch_shapes END (RNN Success) ===\n")
             return info
 
+        # Attempt 2: Fallback to basic call if RNN args fail (For backward compatibility)
         out = try_call("evaluate_actions(obs_pos, actions_pos)",
                        manager.policy.evaluate_actions,
                        obs, batch.get("actions", None))
         if out is not None:
-            print("=== debug_policy_and_batch_shapes END ===\n")
+            print("=== debug_policy_and_batch_shapes END (Legacy Success) ===\n")
             return info
 
+        # Attempt 3: Specific named arguments if needed
         out = try_call("evaluate_actions(agent_feats=..., actions=..., image=...)",
                        manager.policy.evaluate_actions,
-                       agent_feats=candidate_af, actions=batch.get("actions", None), image=obs.get("image", None))
+                       agent_feats=candidate_af,
+                       actions=batch.get("actions", None),
+                       image=obs.get("image", None),
+                       slot_hidden=init_slot,
+                       bev_hidden=init_bev)
         if out is not None:
             print("=== debug_policy_and_batch_shapes END ===\n")
             return info
@@ -358,7 +376,7 @@ def main():
     # If your CarlaEnv has a different constructor, adjust above.
 
     # ---- Manager & Policy ----
-    agent_specs = construct_agent_specs(n_agents=16, obs_dim=128, act_dim=2)
+    agent_specs = construct_agent_specs(n_agents=16, obs_dim=int(env.obs_dim), act_dim=2)
     manager = MAPPOManager(agent_specs=agent_specs, policy_ctor=policy_ctor_from_spec, device=device)
     # ensure manager.policy points to a representative policy for trainer utils
     manager.policy = next(iter(manager.agents.values()))
@@ -379,7 +397,6 @@ def main():
         t0 = time.time()
         try:
             trainer.collect_rollout()
-            trainer.finish_and_update()
         except Exception as e:
             print(f"[Iter {it}] Error during rollout/update: {e}")
             import traceback as tb

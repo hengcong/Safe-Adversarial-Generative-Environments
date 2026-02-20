@@ -1,8 +1,8 @@
 from envs.carla_env import CarlaEnv
 
 # 测试参数
-NUM_RESETS = 50          # 你可以调大，比如 200、500
-STEPS_PER_EPISODE = 200  # 每次 reset 后跑多少步
+NUM_RESETS = 50
+STEPS_PER_EPISODE = 200
 
 env = CarlaEnv(num_veh=30, num_ped=10, mode="MAPPO")
 

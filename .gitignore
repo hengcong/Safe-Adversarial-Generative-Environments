@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Experiments / outputs
+carla_experiments/
+checkpoints/
+debug/
+
+# OS
+.DS_Store

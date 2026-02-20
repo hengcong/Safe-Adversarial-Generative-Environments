@@ -2,8 +2,12 @@ from collections import OrderedDict
 from typing import Dict, Any, Optional, Iterable
 import torch
 import numpy as np
+import copy
+
 import sys
 import traceback
+
+from sympy.assumptions.lra_satask import WHITE_LIST
 
 from buffer.rollout_buffer import RolloutBuffer  # ensure this path is correct for your project
 
@@ -81,7 +85,7 @@ class MAPPOManager(object):
 
         try:
             params = [p for p in self.policy.parameters() if p.requires_grad]
-            self.optim = torch.optim.Adam(params, lr=3e-4, eps=1e-5) if params else None
+            self.optim = torch.optim.Adam(params, lr=5e-5, eps=1e-5) if params else None
         except Exception:
             self.optim = None
 
@@ -92,8 +96,8 @@ class MAPPOManager(object):
         """
         B = 1
         N = len(self.agent_slots)
-        feat_dim = getattr(self, "obs_dim", 128)
-        act_dim = getattr(self.policy, "act_dim", 2) if getattr(self, "policy", None) is not None else 2
+        feat_dim = getattr(self, "obs_dim", 3)
+        act_dim = 2
         gamma = getattr(self, "gamma", 0.99)
         gae_lambda = getattr(self, "gae_lambda", 0.95)
 
@@ -116,475 +120,432 @@ class MAPPOManager(object):
         else:
             self.buffer.clear()
 
-    def store_step(self, imgs, agent_feats, type_ids, actions, logp, values, rewards, masks):
-        """
-        Store one timestep of whole-batch data into the multi-agent RolloutBuffer (expects B dim).
-        Inputs should be numpy or torch; shapes expected:
-         imgs: [B, C, H, W] or None
-         agent_feats: [B, N, F]
-         type_ids: [B, N] or None
-         actions: [B, N, A]
-         logp: [B, N]
-         values: [B, N]
-         rewards: [B, N]
-         masks: [B, N]
-        """
+    def store_step(self, imgs, feats, types, acts, logp, vals, rews, masks, pre_t_np=None, slot_hidden=None, bev_hidden=None):
+
         if self.buffer is None:
-            self.init_rollout_buffer(T=128, image_shape=(3, 84, 84), device=str(self.device))
+            raise RuntimeError("Buffer not initialized")
 
-        imgs_np = _ensure_numpy(imgs)
-        feats_np = _ensure_numpy(agent_feats)
-        types_np = _ensure_numpy(type_ids)
-        acts_np = _ensure_numpy(actions)
-        logp_np = _ensure_numpy(logp)
-        vals_np = _ensure_numpy(values)
-        rews_np = _ensure_numpy(rewards)
-        masks_np = _ensure_numpy(masks)
+        if pre_t_np is None:
+            raise RuntimeError("pre_t_np must be provided from rollout")
 
-        # ensure at least batch dim exists
-        if feats_np is not None and feats_np.ndim == 2:
+        # 统一转 numpy（buffer内部也是numpy）
+        def _to_numpy(x):
+            if x is None:
+                return None
+            if isinstance(x, np.ndarray):
+                return x
+            if torch.is_tensor(x):
+                return x.detach().cpu().numpy()
+            return np.asarray(x)
+
+        imgs_np = _to_numpy(imgs)
+        feats_np = _to_numpy(feats)
+        types_np = _to_numpy(types)
+        acts_np = _to_numpy(acts)
+        logp_np = _to_numpy(logp)
+        vals_np = _to_numpy(vals)
+        rews_np = _to_numpy(rews)
+        masks_np = _to_numpy(masks)
+        pre_t_np = _to_numpy(pre_t_np)
+
+        self.buffer.add_batch(
+            imgs_np,
+            feats_np,
+            types_np,
+            acts_np,
+            logp_np,
+            vals_np,
+            rews_np,
+            masks_np,
+            pre_t_np,
+            slot_hidden=slot_hidden,
+            bev_hidden=bev_hidden
+        )
+
+        return True
+
+    def store_transitions(self,
+                          obs_dict=None,
+                          act_dict=None,
+                          rew_dict=None,
+                          done_dict=None,
+                          val_dict=None,
+                          logp_dict=None,
+                          info_dict=None,
+                          hidden_dict=None):
+
+        if self.buffer is None:
+            raise RuntimeError("Buffer not initialized")
+
+        slots = getattr(self, "agent_slots", list(act_dict.keys()))
+
+        imgs_arr = None
+        if obs_dict and "image" in obs_dict:
+            im = obs_dict["image"]
+            imgs_arr = im.detach().cpu().numpy() if torch.is_tensor(im) else np.asarray(im)
+
+        if imgs_arr is None:
+            imgs_arr = np.zeros((1, 3, 84, 84), dtype=np.float32)
+
+        if imgs_arr.ndim == 3:
+            imgs_arr = imgs_arr[None, ...]
+
+        feats = obs_dict.get("agent_feats", None)
+        feats_np = feats.detach().cpu().numpy() if torch.is_tensor(feats) else np.asarray(feats)
+        if feats_np.ndim == 2:
             feats_np = feats_np[None, ...]
-        if acts_np is not None and acts_np.ndim == 2:
-            acts_np = acts_np[None, ...]
-        if rews_np is not None and rews_np.ndim == 1:
-            rews_np = rews_np[None, ...]
-        if logp_np is not None and logp_np.ndim == 1:
-            logp_np = logp_np[None, ...]
-        if types_np is not None and types_np.ndim == 1:
+
+        types = obs_dict.get("type_id", None)
+        types_np = types.detach().cpu().numpy() if torch.is_tensor(types) else np.asarray(types)
+        if types_np.ndim == 1:
             types_np = types_np[None, ...]
-        if masks_np is not None and masks_np.ndim == 1:
+
+        masks = obs_dict.get("mask", None)
+        masks_np = masks.detach().cpu().numpy() if torch.is_tensor(masks) else np.asarray(masks)
+        if masks_np.ndim == 1:
             masks_np = masks_np[None, ...]
 
-        # call underlying buffer method (implementation-dependent)
-        self.buffer.add_batch(imgs_np, feats_np, types_np, acts_np, logp_np, vals_np, rews_np, masks_np)
+        acts_list = []
+        for idx, s in enumerate(slots):
+            pre_t = np.asarray(logp_dict[s]["pre_t"], dtype=np.float32)
 
-    # Replace existing store_transitions method in mappo_manager.py with this implementation.
+            action_scale = self.policy.action_scale
+            if isinstance(action_scale, torch.Tensor):
+                action_scale = action_scale.detach().cpu().numpy()
 
-    def store_transitions(self, obs_dict=None, act_dict=None, rew_dict=None, done_dict=None,
-                          val_dict=None, logp_dict=None, debug_shapes: bool = False,
-                          strict_image_check: bool = None, **kwargs):
-        """
-        Normalize inputs and call store_step with arrays in expected order.
-        - debug_shapes: if True, print shapes of core arrays before storing (helpful for debugging).
-        - strict_image_check: if True -> raise on missing image; if None -> use manager default self.strict_image_check
-        """
-        import numpy as _np
-        import torch
+            scaled_action = np.tanh(pre_t) * action_scale
+            acts_list.append(scaled_action)
 
-        # use manager-level default if arg not provided
-        if strict_image_check is None:
-            strict_image_check = getattr(self, "strict_image_check", False)
+        acts_np = np.asarray(acts_list, dtype=np.float32)[None, :, :]
 
-        obs = obs_dict if obs_dict is not None else {}
+        lps = []
+        prets = []
 
-        # -------- images normalization -> imgs_arr (numpy, [T,C,H,W]) --------
-        imgs_arr = None
-        if isinstance(obs, dict):
-            if "images" in obs and obs["images"] is not None:
-                imgs_arr = obs["images"]
-            elif "image" in obs and obs["image"] is not None:
-                im = obs["image"]
-                if torch.is_tensor(im):
-                    try:
-                        im_np = im.detach().cpu().numpy()
-                    except Exception:
-                        im_np = None
-                else:
-                    try:
-                        im_np = _np.asarray(im)
-                    except Exception:
-                        im_np = None
-                if im_np is not None:
-                    # handle [B,C,H,W], [C,H,W], [H,W,C] etc.
-                    if im_np.ndim == 4 and im_np.shape[0] == 1:
-                        im_np = im_np[0]  # [C,H,W]
-                    if im_np.ndim == 4 and im_np.shape[-1] in (1, 3, 4) and im_np.shape[1] not in (1, 3, 4):
-                        # ambiguous: maybe [T,H,W,C] or [B,C,H,W]; try detect channel-pos
-                        pass
-                    if im_np.ndim == 3:
-                        imgs_arr = im_np[None, ...]  # [1,C,H,W]
-                    elif im_np.ndim == 4:
-                        # could be [T,C,H,W] or [T,H,W,C] -> if last dim channel, transpose
-                        if im_np.shape[-1] in (1, 3, 4) and im_np.shape[1] not in (1, 3, 4):
-                            imgs_arr = _np.transpose(im_np, (0, 3, 1, 2))
-                        else:
-                            imgs_arr = im_np
-                    else:
-                        imgs_arr = im_np
-
-        # fallback to cached warmup images if present on manager (existing behavior)
-        if imgs_arr is None:
-            seq_store = getattr(self, "last_warmup_images", None)
-            if seq_store is not None:
-                imgs_arr = seq_store
-
-        # --- NEW: explicit handling for missing images ---
-        if imgs_arr is None:
-            msg = "[store_transitions] missing image(s) in obs_dict."
-            if strict_image_check:
-                # strict mode: raise immediately to force upstream fix
-                raise RuntimeError(msg + " Manager strict_image_check=True -- aborting to surface missing images.")
-            # non-strict: warn once and fall back to zero image (but make this explicit)
-            if not getattr(self, "_warned_missing_images", False):
-                print(msg + " Falling back to zero-image placeholder for this step. "
-                            "Set manager.strict_image_check=True to raise instead of fallback.")
-                self._warned_missing_images = True
-            # create zero placeholder consistent with expected sizes
-            bev_ch = int(getattr(self, "bev_ch", getattr(self, "obs_ch", 3)))
-            bev_H = int(getattr(self, "bev_H", getattr(self, "obs_H", 84)))
-            bev_W = int(getattr(self, "bev_W", getattr(self, "obs_W", 84)))
-            imgs_arr = _np.zeros((1, bev_ch, bev_H, bev_W), dtype=_np.float32)
-
-        # ensure numpy array and layout [T,C,H,W]
-        if isinstance(imgs_arr, list):
-            imgs_arr = _np.asarray(imgs_arr)
-        try:
-            imgs_arr = _np.asarray(imgs_arr, dtype=_np.float32)
-        except Exception:
-            imgs_arr = _np.zeros(
-                (1, getattr(self, "bev_ch", 3), getattr(self, "bev_H", 84), getattr(self, "bev_W", 84)),
-                dtype=_np.float32)
-
-        # if imgs_arr is [T,B,C,H,W] -> squeeze B dim if B==1
-        if imgs_arr.ndim == 5 and imgs_arr.shape[1] == 1:
-            imgs_arr = imgs_arr[:, 0, ...]
-
-        # if imgs_arr is [T,H,W,C] -> transpose to [T,C,H,W]
-        if imgs_arr.ndim == 4 and imgs_arr.shape[-1] in (1, 3, 4) and imgs_arr.shape[1] not in (1, 3, 4):
-            imgs_arr = _np.transpose(imgs_arr, (0, 3, 1, 2))
-
-        # -------- agent_feats/types/mask normalization (unchanged but robust) --------
-        feats_np = None
-        types_np = None
-        masks_np = None
-        if isinstance(obs, dict):
-            af = obs.get("agent_feats", None)
-            if af is not None:
-                if torch.is_tensor(af):
-                    af_np = af.detach().cpu().numpy()
-                else:
-                    af_np = _np.asarray(af)
-                # possible shapes: [T,N,F], [T,B,N,F], [N,F], [B,N,F]
-                if af_np.ndim == 4:
-                    feats_np = af_np
-                elif af_np.ndim == 3:
-                    feats_np = af_np
-                elif af_np.ndim == 2:
-                    feats_np = af_np[None, ...]
-                else:
-                    feats_np = af_np
-
-            tid = obs.get("type_id", None)
-            if tid is not None:
-                if torch.is_tensor(tid):
-                    tid_np = tid.detach().cpu().numpy()
-                else:
-                    tid_np = _np.asarray(tid)
-                if tid_np.ndim == 3:
-                    types_np = tid_np
-                elif tid_np.ndim == 2:
-                    types_np = tid_np[None, ...]
-                elif tid_np.ndim == 1:
-                    types_np = tid_np[None, ...]
-                else:
-                    types_np = tid_np
-
-            m = obs.get("mask", None)
-            if m is not None:
-                if torch.is_tensor(m):
-                    m_np = m.detach().cpu().numpy()
-                else:
-                    m_np = _np.asarray(m)
-                if m_np.ndim == 2:
-                    masks_np = m_np[None, ...]
-                elif m_np.ndim == 3:
-                    masks_np = m_np
-                else:
-                    masks_np = m_np
-
-        # -------- actions/logps/vals/rewards normalization (unchanged) --------
-        slots = getattr(self, "agent_slots", list(act_dict.keys()) if act_dict is not None else [])
-        acts_np = None
-        if act_dict is not None:
-            acts_list = []
-            for s in slots:
-                a = act_dict.get(s, None)
-                if a is None:
-                    acts_list.append(_np.zeros((1,), dtype=_np.float32))
-                else:
-                    if torch.is_tensor(a):
-                        acts_list.append(a.detach().cpu().numpy())
-                    else:
-                        acts_list.append(_np.asarray(a))
-            try:
-                stacked = _np.stack(acts_list, axis=0)
-                acts_np = stacked[None, ...]
-            except Exception:
-                acts_np = _np.asarray(acts_list, dtype=object)[None, ...]
-
-        logp_np = None
-        if logp_dict is not None:
-            lps = []
-            for s in slots:
-                lp = logp_dict.get(s, None)
-                if lp is None:
-                    lps.append(0.0)
-                else:
-                    lps.append(float(lp))
-            logp_np = _np.asarray(lps, dtype=_np.float32)[None, :]
-
-        vals_np = None
-        if val_dict is not None:
-            vs = []
-            for s in slots:
-                v = val_dict.get(s, 0.0)
-                vs.append(float(v))
-            vals_np = _np.asarray(vs, dtype=_np.float32)[None, :]
-
-        rews_np = None
-        if rew_dict is not None:
-            rs = []
-            for s in slots:
-                r = rew_dict.get(s, 0.0)
-                rs.append(float(r))
-            rews_np = _np.asarray(rs, dtype=_np.float32)[None, :]
-
-        if masks_np is None:
-            seq_masks = kwargs.get("masks", None)
-            if seq_masks is not None:
-                try:
-                    masks_np = _np.asarray(seq_masks, dtype=_np.float32)
-                except Exception:
-                    masks_np = None
-
-        if masks_np is None:
-            if slots:
-                masks_np = _np.ones((1, len(slots)), dtype=_np.float32)
+        for s in slots:
+            entry = logp_dict.get(s, None)
+            if isinstance(entry, dict):
+                lps.append(float(entry["logp"]))
+                prets.append(np.asarray(entry["pre_t"], dtype=np.float32))
             else:
-                masks_np = _np.ones((1, 1), dtype=_np.float32)
+                raise RuntimeError("logp_dict entry must be dict")
 
-        # --- Optional debug printing of shapes ---
-        if debug_shapes:
-            try:
-                print("[store_transitions:shapes] imgs:", getattr(imgs_arr, "shape", None),
-                      "feats:", getattr(feats_np, "shape", None),
-                      "acts:", getattr(acts_np, "shape", None),
-                      "logp:", getattr(logp_np, "shape", None),
-                      "vals:", getattr(vals_np, "shape", None),
-                      "rews:", getattr(rews_np, "shape", None),
-                      "masks:", getattr(masks_np, "shape", None))
-            except Exception:
-                pass
+        logp_np = np.asarray(lps, dtype=np.float32)[None, :]
+        pre_t_np = np.asarray(prets, dtype=np.float32)[None, :, :]
 
-        # final call to store_step in the expected order
-        return self.store_step(imgs_arr, feats_np, types_np, acts_np, logp_np, vals_np, rews_np, masks_np)
+        vals = []
+        for s in slots:
+            vals.append(float(val_dict.get(s, 0.0)))
+        vals_np = np.asarray(vals, dtype=np.float32)[None, :]
+
+        rews = []
+        for s in slots:
+            rews.append(float(rew_dict.get(s, 0.0)))
+        rews_np = np.asarray(rews, dtype=np.float32)[None, :]
+
+        slot_hidden_np = None
+        bev_hidden_np = None
+
+        if hidden_dict is not None:
+            # 1. Handle Slot Hidden State
+            if "slot" in hidden_dict:
+                h_slots = hidden_dict["slot"]
+
+                # Case A: h_slots is already a Tensor or ndarray [B, N, H] or [N, H]
+                if torch.is_tensor(h_slots) or isinstance(h_slots, np.ndarray):
+                    slot_hidden_np = _ensure_numpy(h_slots)
+                    # Ensure shape is [1, N, H] for batch size 1
+                    if slot_hidden_np.ndim == 2:
+                        slot_hidden_np = slot_hidden_np[None, :, :]
+
+                # Case B: h_slots is a dictionary {slot_id: tensor/array}
+                elif isinstance(h_slots, dict):
+                    h_list = []
+                    for s in slots:
+                        h = h_slots.get(s, None)
+                        if h is not None:
+                            h_list.append(_ensure_numpy(h))
+                        else:
+                            # Padding with zeros if slot is missing
+                            h_list.append(np.zeros(64, dtype=np.float32))
+                    if h_list:
+                        slot_hidden_np = np.asarray(h_list, dtype=np.float32)[None, :, :]
+
+            # 2. Handle BEV Hidden State
+            if "bev" in hidden_dict:
+                h_bev = hidden_dict["bev"]
+                if h_bev is not None:
+                    h_bev_np = _ensure_numpy(h_bev)
+                    # Ensure shape is [1, H]
+                    if h_bev_np.ndim == 1:
+                        h_bev_np = h_bev_np[None, :]
+                    bev_hidden_np = h_bev_np
+
+        return self.store_step(
+            imgs_arr,
+            feats_np,
+            types_np,
+            acts_np,
+            logp_np,
+            vals_np,
+            rews_np,
+            masks_np,
+            pre_t_np=pre_t_np,
+            slot_hidden=slot_hidden_np,
+            bev_hidden=bev_hidden_np
+        )
 
     def update_all(self,
-                   ppo_epochs: int = 4,
-                   mini_batch_size: int = 256,
-                   clip_coef: float = 0.2,
-                   value_coef: float = 0.5,
-                   entropy_coef: float = 0.01,
-                   max_grad_norm: float = 0.5,
-                   lr: float = 3e-4):
+                   ppo_epochs=2,
+                   clip_coef=0.2,
+                   value_coef=0.1,
+                   entropy_coef=0.01,
+                   max_grad_norm=0.5,
+                   num_mini_batches=4):
 
-        buf = self.buffer
-        if buf is None:
-            raise RuntimeError("update_all: no buffer")
-
-        total = int(buf.T) * int(buf.B) * int(buf.N)
-        if total <= 0:
-            buf.clear()
-            raise RuntimeError("update_all: buffer empty or malformed")
+        if self.buffer is None:
+            return {}
 
         params = [p for p in self.policy.parameters() if p.requires_grad]
         if not params:
-            raise RuntimeError("update_all: no trainable params")
+            return {}
 
-        optim = self.optim if hasattr(self, "optim") else torch.optim.Adam(params, lr=lr, eps=1e-5)
+        optim = self.optim
         device = next(self.policy.parameters()).device
 
-        for epoch in range(ppo_epochs):
-            gen_epoch = buf.feed_forward_generator(mini_batch_size=mini_batch_size)
-            for batch_idx, batch in enumerate(gen_epoch):
-                if "agent_feats" not in batch:
-                    raise RuntimeError("update_all: batch missing 'agent_feats'")
-                af_raw = batch["agent_feats"]
-                if isinstance(af_raw, torch.Tensor):
-                    af = af_raw
+        policy_loss_epoch = 0.0
+        value_loss_epoch = 0.0
+        entropy_epoch = 0.0
+        kl_epoch = 0.0
+        clip_frac_epoch = 0.0
+        ev_epoch = 0.0
+        num_updates = 0
+
+        for _ in range(ppo_epochs):
+            for batch in self.buffer.feed_forward_generator(num_mini_batches=num_mini_batches):
+
+                images = batch.get("images", None)
+                agent_feats = batch["agent_feats"]
+                type_id = batch["type_id"]
+                actions = batch["actions"]
+                old_logp = batch["logp"]
+                returns = batch["returns"]
+                advantages = batch["advantages"].to(device)
+                with torch.no_grad():
+                    # Use masks to only normalize valid transitions if necessary,
+                    # but standard batch normalization is usually sufficient:
+                    adv_mean = advantages.mean()
+                    adv_std = advantages.std()
+                    advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+
+                masks = batch["masks"]
+
+                init_slot = batch.get("init_slot_hidden", None)
+                init_bev = batch.get("init_bev_hidden", None)
+
+                # move to device
+                if images is not None:
+                    images = images.to(device)
+                agent_feats = agent_feats.to(device)
+                type_id = type_id.to(device)
+                actions = actions.to(device)
+                old_logp = old_logp.to(device)
+                returns = returns.to(device)
+                advantages = advantages.to(device)
+                masks = masks.to(device)
+                if init_slot is not None:
+                    init_slot = init_slot.to(device)
+                if init_bev is not None:
+                    init_bev = init_bev.to(device)
+                # --- safe handling of optional pre_t from buffer ---
+                pre_t_batch = batch.get("pre_t", None)
+                if pre_t_batch is not None:
+                    # ensure it's a tensor on device/dtype
+                    pre_t_batch = torch.as_tensor(pre_t_batch, device=device, dtype=torch.float32)
                 else:
-                    af = torch.as_tensor(np.asarray(af_raw), dtype=torch.float32)
-                if af.dim() == 3:
-                    B, N, F = af.shape
-                    agent_feats = af.to(device)
-                elif af.dim() == 2:
-                    rows = af.shape[0]
-                    N_try = getattr(buf, "N", None) or getattr(self, "max_slots", None) or 16
-                    N_try = int(N_try)
-                    if rows % N_try != 0:
-                        raise RuntimeError(f"update_all: cannot infer N from agent_feats rows={rows}, N_try={N_try}")
-                    B = rows // N_try
-                    N = N_try
-                    agent_feats = af.view(B, N, af.shape[1]).to(device)
+                    pre_t_batch = None
+
+                # action_scale from policy (make tensor on device)
+                action_scale = getattr(self.policy, "action_scale", 1.0)
+                if not torch.is_tensor(action_scale):
+                    action_scale_t = torch.as_tensor(action_scale, device=device, dtype=torch.float32)
                 else:
-                    raise RuntimeError(f"update_all: agent_feats must be 2D or 3D tensor, got dim={af.dim()}")
+                    action_scale_t = action_scale.to(device=device, dtype=torch.float32)
 
-                def _strict_reshape_to_BN(x_raw, name):
-                    if x_raw is None:
-                        return None
-                    if isinstance(x_raw, torch.Tensor):
-                        t = x_raw
-                    else:
-                        t = torch.as_tensor(np.asarray(x_raw), dtype=torch.float32)
-                    if t.dim() >= 1 and t.shape[0] == B * N:
-                        return t.view(B, N, *t.shape[1:]).to(device)
-                    if t.dim() >= 1 and t.shape[0] == B:
-                        return t.to(device)
-                    raise RuntimeError(
-                        f"update_all: field '{name}' has invalid leading dimension {t.shape[0]}, expected {B * N} or {B}")
-
-                actions = _strict_reshape_to_BN(batch.get("actions", None), "actions")
-                returns = _strict_reshape_to_BN(batch.get("returns", None), "returns")
-
-                _tmp_old = batch.get("logp", None)
-                if _tmp_old is None:
-                    _tmp_old = batch.get("old_log_probs", None)
-                old_log_ps = _strict_reshape_to_BN(_tmp_old, "old_logp")
-
-                advantages = _strict_reshape_to_BN(batch.get("advantages", None), "advantages")
-                if advantages is None:
-                    raise RuntimeError("update_all: advantages required for PPO update")
-                adv_mean = advantages.mean()
-                adv_std = advantages.std()
-                if adv_std.item() == 0:
-                    raise RuntimeError("update_all: advantages std == 0")
-                advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-
-                if actions is not None and actions.shape[0] != B:
-                    raise RuntimeError("update_all: actions batch size mismatch")
-                if returns is not None and returns.shape[0] not in (B, B * N):
-                    raise RuntimeError("update_all: returns shape mismatch")
-
-                obs_for_policy = {"agent_feats": agent_feats}
-                img_raw = batch.get("images", None)
-                if img_raw is None:
-                    img_raw = batch.get("image", None)
-                if img_raw is not None:
-                    if isinstance(img_raw, torch.Tensor):
-                        it = img_raw
-                    else:
-                        it = torch.as_tensor(np.asarray(img_raw), dtype=torch.float32)
-                    if it.dim() == 4 and it.shape[0] == B * N:
-                        it = it.view(B, N, it.shape[1], it.shape[2], it.shape[3])
-                        obs_for_policy["image"] = it.mean(dim=1).to(device)
-                    elif it.dim() == 4 and it.shape[0] == B:
-                        obs_for_policy["image"] = it.to(device)
-                    elif it.dim() == 5 and it.shape[0] == B:
-                        obs_for_policy["image"] = it.mean(dim=1).to(device)
-                    else:
-                        raise RuntimeError(f"update_all: image has unsupported shape {tuple(it.shape)}")
-
-                tid_raw = batch.get("type_id", None)
-                if tid_raw is not None:
-                    if isinstance(tid_raw, torch.Tensor):
-                        tid_t = tid_raw
-                    else:
-                        tid_t = torch.as_tensor(np.asarray(tid_raw), dtype=torch.int64)
-                    if tid_t.dim() == 2 and tuple(tid_t.shape[:2]) == (B, N):
-                        obs_for_policy["type_id"] = tid_t.to(device)
-                    elif tid_t.dim() == 1 and tid_t.shape[0] == B * N:
-                        obs_for_policy["type_id"] = tid_t.view(B, N).to(device)
-                    else:
-                        raise RuntimeError(f"update_all: type_id has unsupported shape {tuple(tid_t.shape)}")
-
-                eval_out = None
-                if hasattr(self, "eval_policy_on_minibatch"):
-                    eval_out = self.eval_policy_on_minibatch(batch)
-                    if not isinstance(eval_out, dict):
-                        raise RuntimeError("update_all: eval_policy_on_minibatch must return dict")
-                else:
-                    policy = self.policy
-                    if hasattr(policy, "evaluate_actions"):
+                # If buffer unexpectedly stored pre_t instead of executed (scaled) actions,
+                # try to reconstruct actions from pre_t when actions look like "empty/unscaled".
+                # Heuristic: if actions max abs is small (< 1e-6) OR all values within [-1,1] but policy scale >1,
+                # then prefer reconstructed actions. This is conservative and won't clobber proper actions.
+                try:
+                    # ensure actions is tensor on device (already moved above)
+                    if pre_t_batch is not None:
+                        # compute candidate actions from pre_t
+                        cand_actions = torch.tanh(pre_t_batch) * action_scale_t.view(1, 1, 1,
+                                                                                     -1) if pre_t_batch.dim() == 4 else torch.tanh(
+                            pre_t_batch) * action_scale_t
+                        # conservative replacement condition:
+                        # replace if actions looks like placeholder (near zero) OR if cand_actions max > actions max by a factor
                         try:
-                            eval_out = policy.evaluate_actions(obs_for_policy, actions)
-                        except Exception as e:
-                            raise RuntimeError(f"update_all: policy.evaluate_actions failed: {e}")
-                    if eval_out is None:
-                        if hasattr(policy, "forward"):
+                            act_max = float(actions.abs().max().item())
+                        except Exception:
+                            act_max = 0.0
+                        try:
+                            cand_max = float(cand_actions.abs().max().item())
+                        except Exception:
+                            cand_max = 0.0
+
+                        if act_max < 1e-6 and cand_max > 1e-6:
+                            actions = cand_actions
+                            print("[WARN] Reconstructed actions from pre_t_batch (buffer likely stored pre_t).")
+                        # else do not overwrite actions; assume buffer stored scaled actions already
+                except Exception as e:
+                    print("[WARN] pre_t handling failed:", e)
+
+                # --- Always compute new_logp/values/entropy via evaluate_actions (do not depend on pre_t presence) ---
+                # prepare obs dict (already moved to device above)
+                obs_eval = {
+                    "image": images,
+                    "agent_feats": agent_feats,
+                    "type_id": type_id
+                }
+
+                # sanity: ensure actions are on device and float
+                actions = actions.to(device=device, dtype=torch.float32)
+
+                # ensure masks dtype/device
+                masks = masks.to(device=device, dtype=torch.float32)
+                eval_out = self.policy.evaluate_actions(
+                    obs={
+                        "image": images,
+                        "agent_feats": agent_feats,
+                        "type_id": type_id
+                    },
+                    actions=actions,
+                    mask=masks,
+                    slot_hidden=init_slot,
+                    bev_hidden=init_bev,
+                    mode="seq",
+                    pre_t=pre_t_batch
+                )
+
+                new_logp = eval_out["log_probs"]
+                values = eval_out["values"]
+                entropy = eval_out["entropy"]
+
+                # safety: shapes should match; if not, try common permute (but also log warning)
+                if new_logp.shape != old_logp.shape:
+                    try:
+                        if new_logp.dim() == 3 and old_logp.dim() == 3 and new_logp.numel() == old_logp.numel():
+                            new_logp = new_logp.permute(1, 0, 2).contiguous()
+                            print("[WARN] permuted new_logp to match old_logp shapes")
+                        else:
+                            print(f"[WARN] shape mismatch new_logp {tuple(new_logp.shape)} vs old_logp {tuple(old_logp.shape)}")
+                    except Exception as e:
+                        print("Shape align permute failed:", e)
+
+                diff = new_logp - old_logp
+                denom = masks.sum() + 1e-8
+
+                # ===== diagnostics (single place, guarded) =====
+                with torch.no_grad():
+                    old_lp = old_logp.to(new_logp.device)
+                    new_lp = new_logp
+                    print("DIAG SHAPES: old_logp", tuple(old_lp.shape), "new_logp", tuple(new_lp.shape))
+                    print("DIAG STATS: old mean,std",
+                          float(old_lp.mean().item()), float(old_lp.std().item()),
+                          "new mean,std", float(new_lp.mean().item()), float(new_lp.std().item()))
+                    d = (new_lp - old_lp)
+                    print("DIFF mean,std,abs_mean,max:",
+                          float(d.mean().item()), float(d.std().item()), float(d.abs().mean().item()), float(d.abs().max().item()))
+                    thr = 3.0
+                    frac_big = (d.abs() > thr).float().mean().item() * 100.0
+                    print(f"FRAC abs(diff)>{thr}: {frac_big:.2f}%")
+                    try:
+                        old_flat = old_lp.flatten(); new_flat = new_lp.flatten()
+                        if old_flat.numel() > 10:
+                            vx = old_flat - old_flat.mean(); vy = new_flat - new_flat.mean()
+                            corr = (vx * vy).sum() / (torch.sqrt((vx * vx).sum() * (vy * vy).sum()) + 1e-8)
+                            print("Pearson corr old_vs_new:", float(corr.item()))
+                    except Exception as e:
+                        print("Pearson corr failed:", e)
+
+                    # safe print of a few per-sample diffs
+                    try:
+                        flat_d = d.flatten()
+                        nshow = min(10, flat_d.numel())
+                        vals, idxs = flat_d.abs().topk(nshow, largest=True)
+                        print("Top diffs (abs) idx,val:", [(int(i.item()), float(v.item())) for i, v in zip(idxs, vals)])
+                        print("First 10 diffs:", [float(x.item()) for x in flat_d[:nshow]])
+                    except Exception:
+                        pass
+                # ===== end diagnostics =====
+
+
+                ratio = torch.exp(diff)
+                # DEBUG: per-batch diagnostics (only print first few updates)
+                if num_updates < 2:
+                    with torch.no_grad():
+                        print("===== DIAG BATCH =====")
+                        print("advantages mean,std:", float(advantages.mean().item()), float(advantages.std().item()))
+                        print("returns mean,std:", float(returns.mean().item()), float(returns.std().item()))
+                        print("values mean,std:", float(values.mean().item()), float(values.std().item()))
+                        try:
+                            print("actions mean,std:", float(actions.mean().item()), float(actions.std().item()))
+                        except Exception:
+                            pass
+                        print("old_logp mean,std:", float(old_logp.mean().item()), float(old_logp.std().item()))
+                        if pre_t_batch is not None:
                             try:
-                                eval_out = policy.forward(obs=obs_for_policy, mode="step", deterministic=True)
-                            except Exception as e:
-                                raise RuntimeError(f"update_all: policy.forward failed: {e}")
-                    if eval_out is None:
-                        raise RuntimeError("update_all: policy evaluation failed")
-                    if not isinstance(eval_out, dict):
-                        raise RuntimeError("update_all: policy evaluation must return dict")
+                                print("pre_t mean,std:", float(pre_t_batch.mean().item()),
+                                      float(pre_t_batch.std().item()))
+                            except Exception:
+                                pass
+                        else:
+                            print("pre_t: None")
 
-                _tmp_log = None
-                for _k in ("log_probs", "logp", "log_prob", "action_logp", "action_log_probs"):
-                    if _k in eval_out and eval_out[_k] is not None:
-                        _tmp_log = eval_out[_k]
-                        break
-                if _tmp_log is None:
-                    raise RuntimeError("update_all: eval_out missing log-prob field (checked keys)")
-                log_probs_new = _tmp_log
-
-                if not isinstance(log_probs_new, torch.Tensor):
-                    log_probs_new = torch.as_tensor(np.asarray(log_probs_new), dtype=torch.float32)
-                log_probs_new = log_probs_new.to(device)
-
-                if old_log_ps is None:
-                    raise RuntimeError("update_all: old_log_ps required")
-                if not isinstance(old_log_ps, torch.Tensor):
-                    old_log_ps = torch.as_tensor(np.asarray(old_log_ps), dtype=torch.float32)
-                old_log_ps = old_log_ps.to(device)
-
-                _tmp_val = None
-                for _k in ("values", "value", "state_value", "v", "critic_value"):
-                    if _k in eval_out and eval_out[_k] is not None:
-                        _tmp_val = eval_out[_k]
-                        break
-                if _tmp_val is None:
-                    raise RuntimeError("update_all: eval_out missing value field (checked keys)")
-                values_pred = _tmp_val
-
-                if not isinstance(values_pred, torch.Tensor):
-                    values_pred = torch.as_tensor(np.asarray(values_pred), dtype=torch.float32)
-                values_pred = values_pred.to(device)
-
-                entropy = eval_out.get("entropy", None)
-                if entropy is None:
-                    entropy = torch.tensor(0.0, device=device)
-                else:
-                    if not isinstance(entropy, torch.Tensor):
-                        entropy = torch.as_tensor(np.asarray(entropy), dtype=torch.float32).to(device)
-
-                if log_probs_new.shape != old_log_ps.shape:
-                    raise RuntimeError(
-                        f"update_all: log_probs shape mismatch new={tuple(log_probs_new.shape)} old={tuple(old_log_ps.shape)}")
-                if advantages.shape != log_probs_new.shape:
-                    raise RuntimeError(
-                        f"update_all: advantages shape {tuple(advantages.shape)} must match log_probs shape {tuple(log_probs_new.shape)}")
-
-                ratio = torch.exp(log_probs_new - old_log_ps)
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
 
-                if values_pred.shape != returns.shape:
-                    values_pred = values_pred.view(returns.shape)
+                policy_loss = -((torch.min(surr1, surr2)) * masks).sum() / denom
+                value_loss = (((returns - values) ** 2) * masks).sum() / denom
+                entropy_loss = (entropy * masks).sum() / denom
 
-                value_loss = (values_pred - returns).pow(2).mean()
-                entropy_term = entropy.mean()
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_loss
 
-                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_term
+                with torch.no_grad():
+                    approx_kl = ((old_logp - new_logp) * masks).sum() / denom
+                    clipped = ((ratio > 1.0 + clip_coef) | (ratio < 1.0 - clip_coef)).float()
+                    clip_fraction = (clipped * masks).sum() / denom
 
+                    var_y = torch.var((returns * masks))
+                    explained_variance = 1 - torch.var(((returns - values) * masks)) / (var_y + 1e-8)
                 optim.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
                 optim.step()
+                policy_loss_epoch += float(policy_loss.item())
+                value_loss_epoch += float(value_loss.item())
+                entropy_epoch += float(entropy_loss.item())
+                kl_epoch += float(approx_kl.item())
+                clip_frac_epoch += float(clip_fraction.item())
+                ev_epoch += float(explained_variance.item())
+                num_updates += 1
 
-        buf.clear()
+        # clear buffer after update
+        self.buffer.clear()
+
+        if num_updates == 0:
+            return {}
+
+        stats = {
+            "policy_loss": policy_loss_epoch / num_updates,
+            "value_loss": value_loss_epoch / num_updates,
+            "entropy": entropy_epoch / num_updates,
+            "approx_kl": kl_epoch / num_updates,
+            "clip_fraction": clip_frac_epoch / num_updates,
+            "explained_variance": ev_epoch / num_updates
+        }
+
+        return stats
 
     def forward(self, obs: Dict[str, torch.Tensor],
                 slot_hidden: Optional[torch.Tensor] = None,
@@ -649,7 +610,7 @@ class MAPPOManager(object):
                                           bev_hidden=bev_hidden,
                                           mask=mask,
                                           mode=mode,
-                                          deterministic=deterministic)
+                                          deterministic=False)
                 if isinstance(out, dict):
                     return out
                 # if forward returned non-dict, wrap minimally
@@ -815,41 +776,116 @@ class MAPPOManager(object):
         # unknown mode: return empty
         return {}
 
-    def select_actions(self, obs_dict, hidden=None, mask=None):
-        """
-        Robust select_actions that accepts:
-          - per-slot obs: {slot: {"image":..., "agent_feats":..., "type_id":..., "mask":...}, ...}
-          - or global obs: {"image":..., "agent_feats":..., "type_id":..., "mask":...}
-        Returns:
-          actions(dict slot->np.array), values(dict slot->float), logps(dict slot->float),
-          next_slot_h, next_bev_h, info
-        """
-        import torch
-        import numpy as np
+    # Add these helper methods to your manager class (same class that has select_actions)
 
-        # --- quick empty check ---
+    def _to_tensor(self, x, dtype=None):
+        import torch
+
+        if x is None:
+            return None
+
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+
+        if dtype is not None:
+            x = x.to(dtype)
+
+        return x.to(self.device)
+
+    def _normalize_slot_hidden(self, sh, B_local, N_local):
+        """Ensure slot_hidden -> [B, N, H] or None."""
+        if sh is None:
+            return None
+        t = self._to_tensor(sh, dtype=torch.float32)
+        if t is None:
+            return None
+        if t.dim() == 4:
+            last = t[-1]
+            t = last
+        if t.dim() == 3:
+            if t.shape[0] != B_local:
+                if t.shape[0] > B_local:
+                    t = t[-B_local:]
+                else:
+                    reps = (B_local // t.shape[0]) + 1
+                    t = t.repeat(reps, 1, 1)[:B_local]
+            if t.shape[1] != N_local:
+                if t.shape[1] == 1:
+                    t = t.repeat(1, N_local, 1)
+                else:
+                    minN = min(t.shape[1], N_local)
+                    t = t[:, :minN, :].contiguous()
+                    if minN < N_local:
+                        pad = torch.zeros((B_local, N_local - minN, t.shape[2]), dtype=t.dtype, device=t.device)
+                        t = torch.cat([t, pad], dim=1)
+            return t.contiguous().to(self.device)
+        if t.dim() == 2:
+            if t.shape[0] == B_local:
+                return t.unsqueeze(1).repeat(1, N_local, 1).contiguous().to(self.device)
+            if t.shape[0] == N_local:
+                return t.unsqueeze(0).contiguous().to(self.device)
+            last = t[-1:].contiguous()
+            return last.unsqueeze(1).repeat(B_local, N_local, 1).contiguous().to(self.device)
+        if t.dim() == 1:
+            return t.unsqueeze(0).unsqueeze(1).repeat(B_local, N_local, 1).contiguous().to(self.device)
+        return None
+
+    def _normalize_bev_hidden(self, bh, B_local):
+        """Ensure bev_hidden -> [B, H] or zeros if None."""
+        if bh is None:
+            try:
+                hdim = int(self.policy.bev_enc.bev_gru.hidden_size)
+            except Exception:
+                hdim = getattr(self.policy, "bev_h_dim", 256)
+            return torch.zeros((B_local, hdim), dtype=torch.float32, device=self.device)
+        t = self._to_tensor(bh, dtype=torch.float32)
+        if t is None:
+            try:
+                hdim = int(self.policy.bev_enc.bev_gru.hidden_size)
+            except Exception:
+                hdim = getattr(self.policy, "bev_h_dim", 256)
+            return torch.zeros((B_local, hdim), dtype=torch.float32, device=self.device)
+        if t.dim() == 3:
+            last = t[-1]
+            t = last
+        if t.dim() == 2:
+            if t.shape[0] != B_local:
+                if t.shape[0] > B_local:
+                    t = t[-B_local:]
+                else:
+                    reps = (B_local // t.shape[0]) + 1
+                    t = t.repeat(reps, 1)[:B_local]
+            return t.contiguous().to(self.device)
+        if t.dim() == 1:
+            return t.unsqueeze(0).contiguous().to(self.device)
+        try:
+            hdim = int(self.policy.bev_enc.bev_gru.hidden_size)
+        except Exception:
+            hdim = getattr(self.policy, "bev_h_dim", 256)
+        import torch as _torch
+        return _torch.zeros((B_local, hdim), dtype=_torch.float32, device=self.device)
+
+    def select_actions(self, obs_dict, hidden=None, mask=None):
+        slots = getattr(self, "agent_slots", list(self.agents.keys()))
+        device = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
+
+        # empty fallback
         if not obs_dict:
             actions = {}
             values = {}
             logps = {}
-            for slot in getattr(self, "agent_slots", list(self.agents.keys())):
+            for slot in slots:
                 agent = self.agents.get(slot, None)
                 act_dim = getattr(agent, "action_dim", getattr(agent, "act_dim", 2)) if agent is not None else 2
                 actions[slot] = np.zeros(act_dim, dtype=np.float32)
                 values[slot] = 0.0
-                logps[slot] = -1e8
+                logps[slot] = {"logp": -1e8, "pre_t": np.zeros((act_dim,), dtype=np.float32)}
             return actions, values, logps, None, None, {}
 
-        # --- slots / per-slot detection ---
-        slots = getattr(self, "agent_slots", list(self.agents.keys()))
+        # detect per-slot or global obs
         is_per_slot = any(k in slots for k in obs_dict.keys())
 
-        # device
-        device = getattr(self, "device", torch.device("cpu"))
-        if isinstance(device, str):
-            device = torch.device(device)
-
-        # --- extract raw pieces ---
+        # extract image / agent_feats / type_id / mask
         if not is_per_slot:
             image_raw = obs_dict.get("image", None)
             agent_feats_raw = obs_dict.get("agent_feats", None)
@@ -863,31 +899,8 @@ class MAPPOManager(object):
             type_id_raw = None
             mask_raw = None
 
-        # fallback to env.latest_image if available
-        if image_raw is None and getattr(self, "env", None) is not None:
-            image_raw = getattr(self.env, "latest_image", None)
-
-        # helper: to torch tensor on device
-        def _to_tensor(x, dtype=None):
-            if x is None:
-                return None
-            if torch.is_tensor(x):
-                t = x
-            else:
-                try:
-                    t = torch.as_tensor(x)
-                except Exception:
-                    try:
-                        import numpy as _np
-                        t = torch.from_numpy(_np.array(x))
-                    except Exception:
-                        return None
-            if dtype is not None:
-                t = t.to(dtype=dtype)
-            return t.to(device)
-
-        # --- normalize image to [B, seq, C, H, W] (seq=1 default) ---
-        img_t = _to_tensor(image_raw)
+        # image to tensor [B, seq, C, H, W]
+        img_t = self._to_tensor(image_raw)
         if img_t is None:
             bev_ch = int(getattr(self, "bev_ch", 3))
             bev_H = int(getattr(self, "bev_H", 84))
@@ -895,10 +908,7 @@ class MAPPOManager(object):
             image_tensor = torch.zeros((1, 1, bev_ch, bev_H, bev_W), dtype=torch.float32, device=device)
         else:
             if img_t.dim() == 5:
-                if img_t.shape[2] not in (1, 3, 4) and img_t.shape[-1] in (1, 3, 4):
-                    image_tensor = img_t.permute(0, 1, 4, 2, 3).contiguous()
-                else:
-                    image_tensor = img_t.contiguous()
+                image_tensor = img_t.contiguous()
             elif img_t.dim() == 4:
                 if img_t.shape[1] in (1, 3, 4):
                     image_tensor = img_t.unsqueeze(1).contiguous()
@@ -924,15 +934,15 @@ class MAPPOManager(object):
         seq_len = int(image_tensor.shape[1])
         N = len(slots)
 
-        # --- build agent_feats/type_id/mask tensors ---
-        obs_dim = int(getattr(self, "obs_dim", 32))
+        obs_dim = getattr(self, "obs_dim", 3)
+
         if is_per_slot:
             per_feats = []
             per_tids = []
             per_masks = []
             for slot in slots:
                 slot_o = obs_dict.get(slot, {})
-                af = _to_tensor(slot_o.get("agent_feats", None))
+                af = self._to_tensor(slot_o.get("agent_feats", None))
                 if af is None:
                     aft = torch.zeros((B, seq_len, obs_dim), dtype=torch.float32, device=device)
                 else:
@@ -950,7 +960,7 @@ class MAPPOManager(object):
                                                                                           device=device)
                 per_feats.append(aft)
 
-                tid = _to_tensor(slot_o.get("type_id", None), dtype=torch.long)
+                tid = self._to_tensor(slot_o.get("type_id", None), dtype=torch.long)
                 if tid is None:
                     tidt = torch.zeros((B, seq_len), dtype=torch.long, device=device)
                 else:
@@ -964,7 +974,7 @@ class MAPPOManager(object):
                             tidt = tidt[:, -seq_len:].contiguous()
                 per_tids.append(tidt)
 
-                m = _to_tensor(slot_o.get("mask", None))
+                m = self._to_tensor(slot_o.get("mask", None))
                 if m is None:
                     mt = torch.ones((B, seq_len), dtype=torch.float32, device=device)
                 else:
@@ -982,7 +992,7 @@ class MAPPOManager(object):
             type_id_tensor = torch.stack(per_tids, dim=2)
             mask_tensor = torch.stack(per_masks, dim=2)
         else:
-            aft = _to_tensor(agent_feats_raw)
+            aft = self._to_tensor(agent_feats_raw)
             if aft is None:
                 agent_feats_tensor = torch.zeros((B, seq_len, N, obs_dim), dtype=torch.float32, device=device)
             else:
@@ -1003,7 +1013,7 @@ class MAPPOManager(object):
                 else:
                     agent_feats_tensor = torch.zeros((B, seq_len, N, obs_dim), dtype=torch.float32, device=device)
 
-            tidt = _to_tensor(type_id_raw, dtype=torch.long)
+            tidt = self._to_tensor(type_id_raw, dtype=torch.long)
             if tidt is None:
                 type_id_tensor = torch.zeros((B, seq_len, N), dtype=torch.long, device=device)
             else:
@@ -1024,7 +1034,7 @@ class MAPPOManager(object):
                 else:
                     type_id_tensor = torch.zeros((B, seq_len, N), dtype=torch.long, device=device)
 
-            mtt = _to_tensor(mask_raw)
+            mtt = self._to_tensor(mask_raw)
             if mtt is None:
                 mask_tensor = torch.ones((B, seq_len, N), dtype=torch.float32, device=device)
             else:
@@ -1050,144 +1060,18 @@ class MAPPOManager(object):
             "type_id": type_id_tensor
         }
 
-        if not torch.is_tensor(mask_tensor):
-            mask_tensor = torch.tensor(mask_tensor, dtype=torch.float32, device=device)
-        else:
-            mask_tensor = mask_tensor.to(device)
-
-        # -------- hidden normalization helpers --------
-        def _norm_slot_hidden_for_policy(sh, B_local, N_local):
-            """
-            Ensure slot_hidden is [B, N, H] (or None). Accepts many input shapes.
-            If input is [T, B, N, H], will return last timestep [B, N, H].
-            """
-            if sh is None:
-                return None
-            if not torch.is_tensor(sh):
-                try:
-                    sh = torch.as_tensor(sh, dtype=torch.float32, device=device)
-                except Exception:
-                    return None
-
-            if sh.dim() == 4:
-                # [T, B, N, H] -> last timestep
-                sh_last = sh[-1]
-                if sh_last.shape[0] != B_local:
-                    if sh_last.shape[0] > B_local:
-                        sh_last = sh_last[-B_local:]
-                    else:
-                        sh_last = sh_last.repeat(B_local // sh_last.shape[0] + 1, 1, 1)[:B_local]
-                if sh_last.shape[1] != N_local:
-                    if sh_last.shape[1] == 1:
-                        sh_last = sh_last.repeat(1, N_local, 1)
-                    else:
-                        minN = min(sh_last.shape[1], N_local)
-                        sh_last = sh_last[:, :minN, :].contiguous()
-                        if minN < N_local:
-                            pad = torch.zeros((B_local, N_local - minN, sh_last.shape[2]), dtype=sh_last.dtype,
-                                              device=sh_last.device)
-                            sh_last = torch.cat([sh_last, pad], dim=1)
-                return sh_last.contiguous().to(device)
-
-            if sh.dim() == 3:
-                # [B, N, H] -> ensure correct B and N
-                sh2 = sh
-                if sh2.shape[0] != B_local:
-                    if sh2.shape[0] > B_local:
-                        sh2 = sh2[-B_local:]
-                    else:
-                        sh2 = sh2.repeat(B_local // sh2.shape[0] + 1, 1, 1)[:B_local]
-                if sh2.shape[1] != N_local:
-                    if sh2.shape[1] == 1:
-                        sh2 = sh2.repeat(1, N_local, 1)
-                    else:
-                        minN = min(sh2.shape[1], N_local)
-                        sh2 = sh2[:, :minN, :].contiguous()
-                        if minN < N_local:
-                            pad = torch.zeros((B_local, N_local - minN, sh2.shape[2]), dtype=sh2.dtype,
-                                              device=sh2.device)
-                            sh2 = torch.cat([sh2, pad], dim=1)
-                return sh2.contiguous().to(device)
-
-            if sh.dim() == 2:
-                # [B, H] or [N, H] -> expand N dimension
-                if sh.shape[0] == B_local:
-                    return sh.unsqueeze(1).repeat(1, N_local, 1).contiguous().to(device)
-                if sh.shape[0] == N_local:
-                    return sh.unsqueeze(0).contiguous().to(device)
-                # fallback: take last row as B=1 and expand
-                last = sh[-1:].contiguous()
-                return last.unsqueeze(1).repeat(B_local, N_local, 1).contiguous().to(device)
-
-            if sh.dim() == 1:
-                return sh.unsqueeze(0).unsqueeze(1).repeat(B_local, N_local, 1).contiguous().to(device)
-
-            return None
-
-        def _norm_bev_hidden_for_policy(bh, B_local):
-            """
-            Ensure bev_hidden is [B, H]. Accepts [T,B,H], [B,H], [T,H], [H], etc.
-            """
-            if bh is None:
-                try:
-                    hdim = int(self.policy.bev_enc.bev_gru.hidden_size)
-                except Exception:
-                    hdim = getattr(self.policy, "bev_h_dim", 256)
-                return torch.zeros((B_local, hdim), dtype=torch.float32, device=device)
-
-            if not torch.is_tensor(bh):
-                try:
-                    bh = torch.as_tensor(bh, dtype=torch.float32, device=device)
-                except Exception:
-                    try:
-                        hdim = int(self.policy.bev_enc.bev_gru.hidden_size)
-                    except Exception:
-                        hdim = getattr(self.policy, "bev_h_dim", 256)
-                    return torch.zeros((B_local, hdim), dtype=torch.float32, device=device)
-
-            if bh.dim() == 3:
-                # [T, B, H] -> take last time
-                last = bh[-1]
-                if last.shape[0] != B_local:
-                    if last.shape[0] > B_local:
-                        last = last[-B_local:]
-                    else:
-                        last = last.repeat(B_local // last.shape[0] + 1, 1)[:B_local]
-                return last.contiguous().to(device)
-
-            if bh.dim() == 2:
-                if bh.shape[0] != B_local:
-                    if bh.shape[0] > B_local:
-                        bh = bh[-B_local:]
-                    else:
-                        bh = bh.repeat(B_local // bh.shape[0] + 1, 1)[:B_local]
-                return bh.contiguous().to(device)
-
-            if bh.dim() == 1:
-                return bh.unsqueeze(0).contiguous().to(device)
-
-            # fallback zeros
-            try:
-                hdim = int(self.policy.bev_enc.bev_gru.hidden_size)
-            except Exception:
-                hdim = getattr(self.policy, "bev_h_dim", 256)
-            return torch.zeros((B_local, hdim), dtype=torch.float32, device=device)
-
+        # normalize hidden
         slot_hidden = None
         bev_hidden = None
         if hidden is not None:
             if isinstance(hidden, dict):
-                slot_hidden = hidden.get("slot", None)
-                bev_hidden = hidden.get("bev", None)
+                slot_hidden = self._normalize_slot_hidden(hidden.get("slot", None), B, N)
+                bev_hidden = self._normalize_bev_hidden(hidden.get("bev", None), B)
             else:
-                slot_hidden = hidden
-                bev_hidden = None
+                slot_hidden = self._normalize_slot_hidden(hidden, B, N)
 
-        # normalize
-        slot_hidden = _norm_slot_hidden_for_policy(slot_hidden, B, N)
-        bev_hidden = _norm_bev_hidden_for_policy(bev_hidden, B)
-
-        actions_t, values_t, logps_t, next_slot_h, next_bev_h, info = self.policy.select_action(
+        # policy forward
+        actions_t, values_t, logps_t, next_slot_h, next_bev_h, policy_info = self.policy.select_action(
             obs_step=obs_step,
             slot_hidden=slot_hidden,
             bev_hidden=bev_hidden,
@@ -1200,12 +1084,11 @@ class MAPPOManager(object):
 
         if isinstance(actions_t, np.ndarray):
             actions_t = torch.from_numpy(actions_t).to(device)
-        if not torch.is_tensor(actions_t):
-            raise RuntimeError(f"[select_actions] actions_t not tensor-like, got {type(actions_t)}")
 
         at = actions_t
         while at.dim() > 3 and at.shape[0] == 1:
             at = at.squeeze(0)
+
         if at.dim() == 4:
             if at.shape[1] == seq_len:
                 out_actions = at[:, -1, :, :].contiguous()
@@ -1224,9 +1107,6 @@ class MAPPOManager(object):
             else:
                 raise RuntimeError(f"[select_actions] unexpected actions dims {tuple(actions_t.shape)}")
 
-        if out_actions.dim() != 3:
-            raise RuntimeError(f"[select_actions] final actions shape unexpected: {tuple(out_actions.shape)}")
-
         B_out, N_out, A_out = int(out_actions.shape[0]), int(out_actions.shape[1]), int(out_actions.shape[2])
 
         if len(slots) != N_out:
@@ -1236,7 +1116,7 @@ class MAPPOManager(object):
             slots = slots[:minN]
             out_actions = out_actions[:, :minN, :]
 
-        def _norm_tensor(t):
+        def _norm_tensor_to_2d(t):
             if t is None:
                 return None
             if isinstance(t, np.ndarray):
@@ -1250,16 +1130,27 @@ class MAPPOManager(object):
                 tt = tt.squeeze(-1)
             return tt
 
-        vals_tensor = _norm_tensor(values_t)
-        lps_tensor = _norm_tensor(logps_t)
+        vals_tensor = _norm_tensor_to_2d(values_t)
+        lps_tensor = _norm_tensor_to_2d(logps_t)
+
+        # extract pre_t if provided in policy_info; else try to reconstruct from policy_info['pre_t']
+        pre_t_tensor = None
+        if isinstance(policy_info, dict) and "pre_t" in policy_info:
+            pre_t_tensor = policy_info["pre_t"]
+            if torch.is_tensor(pre_t_tensor):
+                pre_t_tensor = pre_t_tensor.to(device)
+        # if pre_t_tensor has time dim, squeeze to last step if needed
+        if pre_t_tensor is not None:
+            while pre_t_tensor.dim() > 3 and pre_t_tensor.shape[0] == 1:
+                pre_t_tensor = pre_t_tensor.squeeze(0)
+            # now pre_t_tensor should be [B, N, A] or [N, A]
 
         actions = {}
         values = {}
         logps = {}
         for i, slot in enumerate(slots):
             act_b = out_actions[:, i, :]
-            act0 = act_b[0].detach().cpu().numpy()
-            actions[slot] = act0.astype(np.float32)
+            actions[slot] = act_b[0].detach().cpu().numpy().astype(np.float32)
 
             if vals_tensor is not None:
                 try:
@@ -1270,6 +1161,7 @@ class MAPPOManager(object):
                 v = 0.0
             values[slot] = v
 
+            # build logp item as a dict with both numeric logp and pre_t (numpy)
             if lps_tensor is not None:
                 try:
                     lp_val = float(lps_tensor[0, i].detach().cpu().item())
@@ -1277,7 +1169,41 @@ class MAPPOManager(object):
                     lp_val = float(lps_tensor[0, i].detach().cpu().numpy().reshape(-1)[0])
             else:
                 lp_val = -1e8
-            logps[slot] = lp_val
+
+            # get pre_t per-slot
+            if pre_t_tensor is not None:
+                try:
+                    pre_t_slot = pre_t_tensor[0, i, :].detach().cpu().numpy().astype(np.float32)
+                except Exception:
+                    # fallback: zero vector of action dim
+                    pre_t_slot = np.zeros((A_out,), dtype=np.float32)
+            else:
+                # if policy_info had no pre_t, leave zeros (buffer will still get numeric logp)
+                pre_t_slot = np.zeros((A_out,), dtype=np.float32)
+
+            logps[slot] = {"logp": lp_val, "pre_t": pre_t_slot}
+
+        info = policy_info if isinstance(policy_info, dict) else {}
+
+        # try policy-level entropy helpers
+        try:
+            if "entropy" not in info and hasattr(self.policy, "get_entropy"):
+                ent = self.policy.get_entropy()
+                if torch.is_tensor(ent):
+                    info["entropy"] = float(ent.mean().detach().cpu().item())
+                else:
+                    info["entropy"] = float(ent)
+        except Exception:
+            pass
+        try:
+            if "entropy" not in info and hasattr(self.policy, "last_entropy"):
+                le = getattr(self.policy, "last_entropy")
+                if torch.is_tensor(le):
+                    info["entropy"] = float(le.mean().detach().cpu().item())
+                else:
+                    info["entropy"] = float(le)
+        except Exception:
+            pass
 
         return actions, values, logps, next_slot_h, next_bev_h, info
 
@@ -1317,13 +1243,15 @@ class MAPPOManager(object):
 
         if isinstance(next_slot, torch.Tensor):
             if next_slot.dim() == 4:  # [T,B,N,H]
-                next_slot = next_slot[-1]
-            if next_slot.dim() == 4 and next_slot.shape[0] == 1:
-                next_slot = next_slot.squeeze(0)
+                next_slot = next_slot[-1]  # -> [B,N,H]
+            elif next_slot.dim() == 3:  # [T,N,H]  (B was squeezed)
+                next_slot = next_slot[-1].unsqueeze(0)  # -> [1,N,H]
 
         if isinstance(next_bev, torch.Tensor):
-            if next_bev.dim() == 3 and next_bev.shape[0] == 1:
-                next_bev = next_bev.squeeze(0)
+            if next_bev.dim() == 3:  # [T,B,D]
+                next_bev = next_bev[-1]
+            elif next_bev.dim() == 2:  # [T,D] (B=1)
+                next_bev = next_bev[-1].unsqueeze(0)
 
         if detach:
             if isinstance(next_slot, torch.Tensor):
@@ -1479,7 +1407,7 @@ class MAPPOManager(object):
         if buf is not None:
             try_names = [
                 "finish_rollouts", "finish_rollout", "finish_path",
-                "compute_returns", "add_bootstrap_values", "set_bootstrap_values"
+                "compute_returns", "add_bootstrap_values", "set_bootstrap_values", "finish_paths"
             ]
             for name in try_names:
                 if hasattr(buf, name):
@@ -1691,15 +1619,6 @@ class MAPPOManager(object):
             traceback.print_exc()
 
         print("[debug_policy_input_shapes] END\n")
-
-    def _to_tensor(self, x, device, dtype=None):
-        if x is None:
-            return None
-        if isinstance(x, torch.Tensor):
-            return x.to(device)
-        if dtype is None:
-            dtype = torch.float32
-        return torch.as_tensor(np.asarray(x), dtype=dtype, device=device)
 
     def _reshape_rows(self, x, B, N, device):
         if x is None:

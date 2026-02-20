@@ -1,9 +1,10 @@
-
+import os
 import torch
 import numpy as np
+
 from typing import Optional, Dict, Any, Tuple
 from .trainer import Trainer
-
+from torch.utils.tensorboard import SummaryWriter
 
 class MAPPOTrainer(Trainer):
     """
@@ -25,13 +26,24 @@ class MAPPOTrainer(Trainer):
     def __init__(self,
                  envs,
                  manager,
-                 num_steps: int = 128,
+                 num_steps: int = 256,
                  device: str = "cpu",
                  **kwargs):
         super().__init__(envs=envs, manager=manager, device=device, **kwargs)
         self.T = int(num_steps)
+        self.tb = SummaryWriter(log_dir=envs.experiment_path)
+        self.global_ep = 0
+        self._coll_hist = []
         # number of parallel environments
-        self.num_envs = getattr(envs, "num_envs", None)
+        if hasattr(envs, "num_envs"):
+            self.num_envs = envs.num_envs
+        else:
+            self.num_envs = 1
+
+        self.best_return = float("-inf")
+
+        self.ckpt_dir = os.path.join(envs.experiment_path, "checkpoints")
+        os.makedirs(self.ckpt_dir, exist_ok=True)
         if self.num_envs is None:
             # try len()
             try:
@@ -40,7 +52,7 @@ class MAPPOTrainer(Trainer):
                 self.num_envs = 1
 
         # initialize envs and manager
-        init_obs = self.envs.reset()
+        init_obs = None #self.envs.reset()
         # map manager with initial observations
         if hasattr(self.manager, "mappo_reset"):
             try:
@@ -49,27 +61,6 @@ class MAPPOTrainer(Trainer):
                 # fallback: call without args
                 self.manager.mappo_reset({})
 
-        # # initialize hidden states per env (if supported)
-        # self.hidden_per_env = None
-        # if hasattr(self.manager, "get_initial_hidden"):
-        #     # we need n_agent; try to fetch from manager.agent_slots or manager.agents
-        #     n_agents = getattr(self.manager, "n_agents", None)
-        #     if n_agents is None:
-        #         # try to infer from first agent policy
-        #         try:
-        #             first_agent = next(iter(self.manager.agents.values()))
-        #             n_agents = getattr(first_agent.policy, "n_agent", None) or getattr(first_agent, "n_agent", None)
-        #         except Exception:
-        #             n_agents = None
-        #
-        #     if n_agents is None:
-        #         # leave hidden None; manager.select_actions should accept None
-        #         self.hidden_per_env = None
-        #     else:
-        #         slot_h, bev_h = self.manager.get_initial_hidden(self.num_envs, n_agents)
-        #         self.hidden_per_env = {"slot": slot_h, "bev": bev_h}
-        # initialize hidden states per env (if supported)
-        # initialize hidden states per env (if supported)
         self.hidden_per_env = None
         if hasattr(self.manager, "get_initial_hidden"):
             # infer n_agents from manager.agent_slots (most reliable)
@@ -140,311 +131,126 @@ class MAPPOTrainer(Trainer):
 
     def collect_rollout(self):
 
-        import numpy as np
-        import torch
-
         env = self.envs
         manager = self.manager
         T = self.T
 
-        # -------- RESET ENV + WARMUP SEQ --------
-        seq = env.reset()  # {"obs_hist":..., "seq": {...}}
+        # =======================
+        # 1. RESET & INIT
+        # =======================
+        seq = env.reset()
         seq_dict = seq.get("seq", {})
 
-        seq_agent_feats = seq_dict.get("agent_feats", None)
-        seq_type_ids = seq_dict.get("type_id", None)
-        seq_masks = seq_dict.get("mask", None)
-        seq_images = seq_dict.get("images", None)
-
-        # ---- build obs_seq dict for manager.burn_in ----
         obs_seq = {}
 
-        # images → normalize to [T, B, C, H, W] with B=1
-        if seq_images is not None:
-            imgs = seq_images
-            if isinstance(imgs, np.ndarray):
-                if imgs.ndim == 4:
-                    if imgs.shape[-1] in (1, 3, 4):
-                        imgs = np.transpose(imgs, (0, 3, 1, 2))  # [T,H,W,C] -> [T,C,H,W]
-                else:
-                    try:
-                        imgs = np.asarray(imgs)
-                        if imgs.ndim == 5:
-                            if imgs.shape[1] == 1:
-                                imgs = imgs[:, 0, ...]
-                            elif imgs.shape[0] == 1:
-                                imgs = imgs[0, ...]
-                    except Exception:
-                        raise RuntimeError(
-                            f"collect_rollout: seq_images has unsupported ndim={getattr(seq_images, 'ndim', None)}"
-                        )
-            else:
-                try:
-                    imgs = np.asarray(imgs)
-                    if imgs.ndim == 4 and imgs.shape[-1] in (1, 3, 4):
-                        imgs = np.transpose(imgs, (0, 3, 1, 2))
-                except Exception:
-                    imgs = None
+        if "images" in seq_dict and seq_dict["images"] is not None:
+            imgs = np.asarray(seq_dict["images"])
+            if imgs.ndim == 4 and imgs.shape[-1] in (1, 3, 4):
+                imgs = np.transpose(imgs, (0, 3, 1, 2))
+            obs_seq["image"] = torch.tensor(imgs, dtype=torch.float32).unsqueeze(1)
 
-            if imgs is not None:
-                imgs = imgs.astype(np.float32, copy=False)
-                obs_seq["image"] = torch.tensor(imgs, dtype=torch.float32).unsqueeze(1)
+        if "agent_feats" in seq_dict and seq_dict["agent_feats"] is not None:
+            af = torch.tensor(seq_dict["agent_feats"], dtype=torch.float32)
+            if af.ndim == 3:
+                af = af.unsqueeze(1)
+            obs_seq["agent_feats"] = af
 
-        # agent_feats → [T,B,N,F]
-        if seq_agent_feats is None:
-            single = env.get_single_obs_for_manager()
-            if single is None:
-                raise RuntimeError("collect_rollout: cannot infer agent_feats shape")
-            a = single.get("agent_feats", None)
-            if a is None:
-                raise RuntimeError("collect_rollout: cannot infer agent_feats")
-
-            if torch.is_tensor(a):
-                B_, N_, F_ = int(a.shape[0]), int(a.shape[1]), int(a.shape[2])
-            else:
-                ar = np.asarray(a)
-                if ar.ndim == 3:
-                    B_, N_, F_ = ar.shape
-                elif ar.ndim == 2:
-                    B_, N_, F_ = 1, ar.shape[0], ar.shape[1]
-                else:
-                    raise RuntimeError("collect_rollout: unexpected agent_feats shape")
-
-            burn_T = int(getattr(self.envs, "seq_len", 10))
-            seq_agent_feats = np.zeros((burn_T, N_, F_), dtype=np.float32)
-
-        af = torch.tensor(seq_agent_feats, dtype=torch.float32)
-        if af.ndim == 3:
-            af = af.unsqueeze(1)
-        elif af.ndim != 4:
-            raise RuntimeError(f"collect_rollout: seq_agent_feats unexpected ndim={af.ndim}")
-        obs_seq["agent_feats"] = af
-
-        # type_ids → [T,B,N]
-        if seq_type_ids is not None:
-            tid = torch.tensor(seq_type_ids, dtype=torch.long)
+        if "type_id" in seq_dict and seq_dict["type_id"] is not None:
+            tid = torch.tensor(seq_dict["type_id"], dtype=torch.long)
             if tid.ndim == 2:
                 tid = tid.unsqueeze(1)
             obs_seq["type_id"] = tid
 
-        # masks → [T,B,N]
-        if seq_masks is not None:
-            m = torch.tensor(seq_masks, dtype=torch.float32)
+        if "mask" in seq_dict and seq_dict["mask"] is not None:
+            m = torch.tensor(seq_dict["mask"], dtype=torch.float32)
             if m.ndim == 2:
                 m = m.unsqueeze(1)
             obs_seq["mask"] = m
 
-        # ---- burn-in hidden ----
+        # 2. Burn-in to get the initial hidden state for this new episode
+        # This function correctly extracts the last hidden state from the init sequence
         hidden_slot, hidden_bev = manager.burn_in(obs_seq, detach=True)
+
+        # Here 'hidden' represents the memory at t=0
         hidden = {"slot": hidden_slot, "bev": hidden_bev}
 
-        # ---- initial obs from last warmup frame ----
         obs = env.get_single_obs_for_manager()
+
+        # 3. Reset buffer and store the INITIAL hidden state
         manager.reset_buffer()
+        manager.buffer.set_initial_hidden(hidden_slot, hidden_bev)
 
-        # -------- MAIN ROLLOUT LOOP --------
+        # 4. Start the rollout loop
+        ep_len = 0
+        ep_return = 0.0
+        all_rewards = []
+        last_env_info = {}
         for t in range(T):
-
-            # ensure obs contains time-seq "images" when manager/store requires it
-            try:
-                if isinstance(obs, dict):
-                    if "images" not in obs:
-                        if "image" in obs and obs["image"] is not None:
-                            im = obs["image"]
-
-                            if torch.is_tensor(im):
-                                im_np = im.detach().cpu().numpy()
-                            else:
-                                try:
-                                    im_np = np.asarray(im)
-                                except Exception:
-                                    im_np = None
-
-                            if im_np is not None:
-                                if im_np.ndim == 4:
-                                    if im_np.shape[0] == 1:
-                                        im_np = im_np[0]  # [C,H,W]
-                                    else:
-                                        im_np = im_np[0]
-                                if im_np.ndim == 3:
-                                    im_np = im_np[None, ...]  # [1,C,H,W]
-                                elif im_np.ndim == 2:
-                                    im_np = im_np[None, None, ...]
-
-                                imgs_arr = im_np.astype(np.float32)
-                                obs["images"] = imgs_arr
-                        else:
-                            if "image" in obs_seq:
-                                try:
-                                    seq_img = obs_seq["image"]
-                                    if torch.is_tensor(seq_img):
-                                        seq_img_np = seq_img.detach().cpu().numpy()
-                                        last = seq_img_np[-1, 0]
-                                        obs["images"] = last[None, ...]
-                                except Exception:
-                                    pass
-            except Exception:
-                pass
-
-            # select actions
-            actions, values, logps, next_slot_h, next_bev_h, info = manager.select_actions(
+            ep_len += 1
+            actions, values, logps, next_slot_h, next_bev_h, policy_info = manager.select_actions(
                 obs_dict=obs,
                 hidden=hidden,
                 mask=obs.get("mask", None)
             )
+            next_obs, rewards_dict, dones_dict, env_info = env.step(actions)
 
-            # step env
-            nxt_obs, rewards_dict, dones_dict, _ = env.step(actions)
+            # --- [LOGGING UPDATE] KEEP THIS! ---
+            last_env_info = env_info
+            step_reward = np.mean(list(rewards_dict.values()))
+            ep_return += step_reward
+            all_rewards.append(step_reward)
 
-            slot_list = manager.agent_slots
-            rewards = np.array([rewards_dict.get(s, 0.0) for s in slot_list], dtype=np.float32)[None, :]
-            dones = np.array([dones_dict.get(s, False) for s in slot_list], dtype=np.bool_)[None, :]
-            vals = np.array([values[s] for s in slot_list], dtype=np.float32)[None, :]
-            lps = np.array([logps[s] for s in slot_list], dtype=np.float32)[None, :]
-
-            # store
             manager.store_transitions(
                 obs_dict=obs,
                 act_dict=actions,
                 rew_dict=rewards_dict,
                 done_dict=dones_dict,
                 val_dict=values,
-                logp_dict=logps
+                logp_dict=logps,
+                info_dict=policy_info,
+                hidden_dict=hidden
             )
-
             hidden = {"slot": next_slot_h, "bev": next_bev_h}
-            obs = nxt_obs
+            obs = next_obs
 
-            if dones.any():
+            if any(dones_dict.values()):
                 break
 
-        # -------- BOOTSTRAP --------
-        # manager may not implement value(); use select_actions to obtain values from policy
+        # =======================
+        # 3. BOOTSTRAP
+        # =======================
         try:
-            # call select_actions in deterministic mode to get values only
-            actions_tmp, values_tmp, logps_tmp, next_slot_h_tmp, next_bev_h_tmp, info_tmp = manager.select_actions(
+            # Bootstrap value using the last hidden state
+            actions_tmp, values_tmp, _, _, _, _ = manager.select_actions(
                 obs_dict=obs,
-                hidden=hidden,
+                hidden=hidden,  # Using the hidden state of the last step
                 mask=obs.get("mask", None)
             )
-            # values_tmp is a dict: slot -> float
             slot_list = manager.agent_slots
-            last_vals_arr = np.array([values_tmp.get(s, 0.0) for s in slot_list], dtype=np.float32)[None, :]
-            manager.finish_rollouts(last_vals_arr)
-        except Exception as e:
-            # fallback: if select_actions fails, provide zeros to finish_rollouts to avoid crash
-            print("[WARN] bootstrap: failed to get values via manager.select_actions(), falling back to zeros:", e)
+            last_vals_arr = np.array(
+                [values_tmp.get(s, 0.0) for s in slot_list],
+                dtype=np.float32
+            )[None, :]
+        except Exception:
             slot_list = manager.agent_slots
             last_vals_arr = np.zeros((1, len(slot_list)), dtype=np.float32)
-            manager.finish_rollouts(last_vals_arr)
 
-        # -------- UPDATE --------
-        manager.update_all()
+        manager.finish_rollouts(last_vals_arr)
 
-    # def collect_rollout(self) -> None:
-    #     """
-    #     Collect self.T steps for all parallel envs and store into manager/buffers.
-    #     This implementation iterates envs and calls manager.select_actions() per env.
-    #     If your envs supports vectorized batch step you can modify it to call manager once per batch.
-    #     """
-    #     for t in range(self.T):
-    #         obs_all = self._get_obs_all()  # may be list of per-env obs dicts, or dict keyed by vehicles
-    #         if obs_all is None:
-    #             raise RuntimeError("Could not get observations from envs; make sure envs.reset() or get_obs_all() is implemented.")
-    #
-    #         # store selections for each env
-    #         actions_per_env = [None] * self.num_envs
-    #         info_per_env = [None] * self.num_envs
-    #         values_per_env = [None] * self.num_envs
-    #         logps_per_env = [None] * self.num_envs
-    #         next_slot_hidden_per_env = [None] * self.num_envs
-    #         next_bev_hidden_per_env = [None] * self.num_envs
-    #
-    #         # 1) select actions
-    #         # Accept obs_all as list-like (per env) or a dict (single env mapping)
-    #         if isinstance(obs_all, (list, tuple)):
-    #             for i, obs in enumerate(obs_all):
-    #                 # get hidden for this env if available
-    #                 slot_h = None
-    #                 bev_h = None
-    #                 if self.hidden_per_env is not None:
-    #                     slot_h = self.hidden_per_env.get("slot")[i] if self.hidden_per_env.get("slot") is not None else None
-    #                     bev_h = self.hidden_per_env.get("bev")[i] if self.hidden_per_env.get("bev") is not None else None
-    #
-    #                 # manager.select_actions expected signature: select_actions(obs_dict, hidden=...)
-    #                 # but many implementations use select_actions(obs_dict) -> (actions, values, logp, next_slot_h, next_bev_h, info)
-    #                 sel = self.manager.select_actions(obs, slot_hidden=slot_h, bev_hidden=bev_h) \
-    #                       if self._select_actions_accepts_kwargs() else self.manager.select_actions(obs)
-    #                 # normalize return
-    #                 actions, values, logps, next_slot_h, next_bev_h, info = self._unpack_select_return(sel)
-    #                 actions_per_env[i] = actions
-    #                 values_per_env[i] = values
-    #                 logps_per_env[i] = logps
-    #                 info_per_env[i] = info
-    #                 next_slot_hidden_per_env[i] = next_slot_h
-    #                 next_bev_hidden_per_env[i] = next_bev_h
-    #         else:
-    #             # obs_all is not list: assume single-env mapping keyed by vehicle ids; treat as 1 env
-    #             slot_h = None
-    #             bev_h = None
-    #             if self.hidden_per_env is not None:
-    #                 slot_h = self.hidden_per_env.get("slot")[0] if self.hidden_per_env.get("slot") is not None else None
-    #                 bev_h = self.hidden_per_env.get("bev")[0] if self.hidden_per_env.get("bev") is not None else None
-    #
-    #             sel = self.manager.select_actions(obs_all, slot_hidden=slot_h, bev_hidden=bev_h) \
-    #                   if self._select_actions_accepts_kwargs() else self.manager.select_actions(obs_all)
-    #             actions, values, logps, next_slot_h, next_bev_h, info = self._unpack_select_return(sel)
-    #             actions_per_env[0] = actions
-    #             values_per_env[0] = values
-    #             logps_per_env[0] = logps
-    #             info_per_env[0] = info
-    #             next_slot_hidden_per_env[0] = next_slot_h
-    #             next_bev_hidden_per_env[0] = next_bev_h
-    #
-    #         # 2) step envs and store transitions
-    #         # We'll call env.step(env_idx, actions) for each env
-    #         for i in range(self.num_envs):
-    #             act = actions_per_env[i]
-    #             nxt_obs, rewards, dones, env_info = self._step_env(i, act)
-    #             # store transitions into manager -> manager will route to per-slot buffers
-    #             # manager.store_transitions(obs, actions, rewards, dones, values, logps)
-    #             obs_i = obs_all[i] if isinstance(obs_all, (list, tuple)) else obs_all
-    #             vals = self._ensure_dict_like(values_per_env[i])
-    #             lps = self._ensure_dict_like(logps_per_env[i])
-    #             self.manager.store_transitions(obs_i, act, rewards, dones, vals, lps)
-    #
-    #             # maintain hidden states per env if available
-    #             if self.hidden_per_env is not None:
-    #                 if next_slot_hidden_per_env[i] is not None:
-    #                     # expected shape for manager.get_initial_hidden outputs: slot_hidden [B,N,H] with first dim = num_envs
-    #                     self.hidden_per_env["slot"][i] = next_slot_hidden_per_env[i]
-    #                 if next_bev_hidden_per_env[i] is not None:
-    #                     self.hidden_per_env["bev"][i] = next_bev_hidden_per_env[i]
-    #
-    #             # if any agents respawned (dones), reset hidden for those agents if manager supports it
-    #             if self.hidden_per_env is not None and hasattr(self.manager, "reset_hidden_for_agents"):
-    #                 # build respawn mask from dones (expected per-agent mask {slot: bool} or array)
-    #                 # ADAPT HERE if your dones format differs
-    #                 try:
-    #                     respawn_mask = self._build_respawn_mask_from_dones(dones)
-    #                     if respawn_mask is not None:
-    #                         self.hidden_per_env["slot"][i] = self.manager.reset_hidden_for_agents(self.hidden_per_env["slot"][i], respawn_mask)
-    #                 except Exception:
-    #                     # ignore reset if incompatible
-    #                     pass
-    #
-    #             # update last_obs cache
-    #             if isinstance(obs_all, (list, tuple)):
-    #                 # replace ith obs with next
-    #                 try:
-    #                     obs_all[i] = nxt_obs
-    #                 except Exception:
-    #                     pass
-    #             else:
-    #                 self._last_obs_all = nxt_obs
-    #
-    #         # update counters
-    #         self.global_step += self.num_envs
+        # =======================
+        # 4. UPDATE
+        # =======================
+        stats = manager.update_all()
+
+        if stats is not None:
+            for k, v in stats.items():
+                self.tb.add_scalar(f"train/{k}", v, self.global_step)
+
+        if hasattr(self, "tb"):
+            self.tb.add_scalar("train/ep_return", ep_return, self.global_step)
+            self.tb.add_scalar("train/ep_len", ep_len, self.global_step)
+
+        self.global_step += 1
 
     # ---------------------- finish_and_update ----------------------
     def finish_and_update(self) -> None:

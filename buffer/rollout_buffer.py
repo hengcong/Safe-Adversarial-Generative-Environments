@@ -48,6 +48,8 @@ class RolloutBuffer:
                  gamma: float = 0.99,
                  gae_lambda: float = 0.95,
                  device: str = "cpu"):
+
+
         self.T = int(T)
         self.B = int(num_envs)
         self.N = int(n_agents)
@@ -55,33 +57,29 @@ class RolloutBuffer:
         self.gamma = float(gamma)
         self.gae_lambda = float(gae_lambda)
 
-        # images per env (BEV is per-env per-timestep, not per-agent)
         if image_shape is not None:
             C, H, W = image_shape
             self.images = np.zeros((self.T, self.B, C, H, W), dtype=np.float32)
         else:
             self.images = None
 
-        # per-agent numeric features [T, B, N, feat_dim]
         self.agent_feats = np.zeros((self.T, self.B, self.N, int(agent_feat_dim)), dtype=np.float32)
-
-        # per-agent type ids [T, B, N] (int64)
         self.type_id = np.zeros((self.T, self.B, self.N), dtype=np.int64)
 
-        # actions/logp/values/rewards/masks: per-agent
         self.actions = np.zeros((self.T, self.B, self.N, int(act_dim)), dtype=np.float32)
         self.logp = np.zeros((self.T, self.B, self.N), dtype=np.float32)
-        # store scalar value per agent (shape [T,B,N])
         self.values = np.zeros((self.T, self.B, self.N), dtype=np.float32)
         self.rewards = np.zeros((self.T, self.B, self.N), dtype=np.float32)
-        # mask: 1.0 = alive, 0.0 = just-died (prevents hidden leakage)
         self.masks = np.ones((self.T, self.B, self.N), dtype=np.float32)
 
-        # computed after finish_paths
+        self.pre_t = np.zeros((self.T, self.B, self.N, int(act_dim)), dtype=np.float32)
+        self.action_scale = 5.0
+        self.slot_hidden = None
+        self.bev_hidden = None
+
         self.advantages = np.zeros((self.T, self.B, self.N), dtype=np.float32)
         self.returns = np.zeros((self.T, self.B, self.N), dtype=np.float32)
 
-        # pointer
         self.ptr = 0
         self.full = False
 
@@ -93,22 +91,16 @@ class RolloutBuffer:
                   logp,
                   values,
                   rewards,
-                  masks):
-        """
-        Add one timestep's whole-batch data. Accepts numpy arrays or torch tensors.
-        Shapes (expected):
-          imgs: [B, C, H, W] or None if buffer was created without images
-          agent_feats: [B, N, feat_dim]
-          type_ids: [B, N]
-          actions: [B, N, A]
-          logp: [B, N]
-          values: [B, N] or [B, N, 1]
-          rewards: [B, N]
-          masks: [B, N]  (1=alive, 0=just-died)
-        """
+                  masks,
+                  pre_t_np=None,
+                  slot_hidden=None,
+                  bev_hidden=None):
+
+        if pre_t_np is None:
+            raise RuntimeError("pre_t_np must be provided")
+
         t = self.ptr
 
-        # convert to numpy if torch provided
         imgs_np = _to_numpy(imgs)
         feats_np = _to_numpy(agent_feats)
         types_np = _to_numpy(type_ids)
@@ -117,8 +109,8 @@ class RolloutBuffer:
         vals_np = _to_numpy(values)
         rews_np = _to_numpy(rewards)
         masks_np = _to_numpy(masks)
+        pre_t_np = _to_numpy(pre_t_np)
 
-        # basic checks
         if feats_np.shape[0] != self.B:
             raise ValueError(f"agent_feats batch-size mismatch: expected B={self.B}, got {feats_np.shape[0]}")
 
@@ -132,7 +124,6 @@ class RolloutBuffer:
         self.actions[t] = actions_np.astype(np.float32)
         self.logp[t] = logp_np.astype(np.float32)
 
-        # values: allow [B,N,1] or [B,N]
         vals_np = np.asarray(vals_np, dtype=np.float32)
         if vals_np.ndim == 3 and vals_np.shape[-1] == 1:
             vals_np = vals_np.reshape(vals_np.shape[0], vals_np.shape[1])
@@ -141,7 +132,27 @@ class RolloutBuffer:
         self.rewards[t] = rews_np.astype(np.float32)
         self.masks[t] = masks_np.astype(np.float32)
 
-        # advance pointer
+        if pre_t_np.ndim == 2:
+            pre_t_np = pre_t_np[None, :, :]
+        self.pre_t[t] = pre_t_np.astype(np.float32)
+        if slot_hidden is not None:
+            slot_np = _to_numpy(slot_hidden)
+            if slot_np.ndim == 3 and slot_np.shape[0] == 1:
+                slot_np = slot_np.squeeze(0)
+            if slot_np.shape[0] == self.B * self.N:
+                slot_np = slot_np.reshape(self.B, self.N, -1)
+            if self.slot_hidden is None:
+                h_dim = slot_np.shape[-1]
+                self.slot_hidden = np.zeros((self.T, self.B, self.N, h_dim), dtype=np.float32)
+            self.slot_hidden[t] = slot_np.astype(np.float32)
+
+        if bev_hidden is not None:
+            bev_np = _to_numpy(bev_hidden)
+            if bev_np.ndim == 3: bev_np = bev_np.squeeze(0)
+            if self.bev_hidden is None:
+                h_dim = bev_np.shape[-1]
+                self.bev_hidden = np.zeros((self.T, self.B, h_dim), dtype=np.float32)
+            self.bev_hidden[t] = bev_np.astype(np.float32)
         self.ptr += 1
         if self.ptr >= self.T:
             self.full = True
@@ -169,87 +180,128 @@ class RolloutBuffer:
             rewards_t = self.rewards[t]  # [B,N]
             values_t = self.values[t]  # [B,N]
             delta = rewards_t + self.gamma * next_values * mask_t - values_t
+            #print("[DEBUG finish_paths rewards_t mean]", rewards_t.mean())
+
             adv = delta + self.gamma * self.gae_lambda * adv * mask_t
             self.advantages[t] = adv
-            next_values = values_t
+            next_values = values_t#* mask_t
 
         # returns = advantages + values
         self.returns = self.advantages + self.values
 
-        # normalize advantages (global)
-        flat_adv = self.advantages.reshape(-1)
-        if flat_adv.size > 0:
-            adv_mean = flat_adv.mean()
-            adv_std = flat_adv.std()
-            self.advantages = (self.advantages - adv_mean) / (adv_std + 1e-8)
+        # -------- mask-aware advantage normalization --------
+        valid_mask = self.masks > 0  # shape [T,B,N]
 
-    def feed_forward_generator(self, mini_batch_size: int) -> Iterator[Dict[str, torch.Tensor]]:
-        """
-        Yield minibatches by flattening T,B,N -> total = T*B*N.
-        Each yielded dict contains torch tensors on self.device:
-            - images (if present): [mb, C, H, W] or None
-            - agent_feats: [mb, feat_dim]
-            - type_id: [mb] (long)
-            - actions: [mb, A]
-            - old_logp: [mb]
-            - returns: [mb, 1]
-            - advantages: [mb]
-            - values: [mb, 1]
-            - indices: the flat indices into T*B*N (optional)
-        """
-        T, B, N = self.T, self.B, self.N
-        total = T * B * N
+        valid_adv = self.advantages[valid_mask]
 
-        # flatten per-agent arrays for efficient indexing
-        flat_agent_feats = self.agent_feats.reshape(total, -1)     # [total, feat_dim]
-        flat_type = self.type_id.reshape(total)
-        flat_actions = self.actions.reshape(total, -1)
-        flat_logp = self.logp.reshape(total)
-        flat_returns = self.returns.reshape(total)
-        flat_adv = self.advantages.reshape(total)
-        flat_values = self.values.reshape(total)
+        if valid_adv.size > 0:
+            adv_mean = valid_adv.mean()
+            adv_std = valid_adv.std() + 1e-8
 
-        # prepare indices and shuffle
-        indices = np.arange(total)
+            self.advantages = (self.advantages - adv_mean) / adv_std
+            self.advantages *= self.masks
+
+    def feed_forward_generator(self, num_mini_batches=4):
+        # Buffer is Time-Major: [T, B, N, ...]
+        # We slice along the Batch dimension (B) to preserve sequences for RNN.
+        # We also slice the Time dimension (T) to valid_limit to discard empty padding.
+
+        total_envs = self.B
+
+        # Calculate mini-batch size for the batch dimension
+        mini_batch_size = max(1, total_envs // num_mini_batches)
+
+        # Shuffle environment indices
+        indices = np.arange(total_envs)
         np.random.shuffle(indices)
 
-        for start in range(0, total, mini_batch_size):
-            batch_idx = indices[start:start + mini_batch_size]
-            # map flat idx -> (t,b,n)
-            t_idx = (batch_idx // (B * N)).astype(np.int64)
-            rem = batch_idx % (B * N)
-            b_idx = (rem // N).astype(np.int64)
-            # n_idx = rem % N  # unused here except if needed
+        # Determine valid length: use self.ptr if not full (early break), else self.T
+        valid_limit = self.T if self.full else self.ptr
 
-            feats_mb = flat_agent_feats[batch_idx]   # [mb, feat_dim]
-            types_mb = flat_type[batch_idx]         # [mb]
-            actions_mb = flat_actions[batch_idx]    # [mb, A]
-            old_logp_mb = flat_logp[batch_idx]      # [mb]
-            returns_mb = flat_returns[batch_idx].reshape(-1, 1)  # [mb,1]
-            adv_mb = flat_adv[batch_idx]            # [mb]
-            values_mb = flat_values[batch_idx].reshape(-1, 1)   # [mb,1]
+        # Guard against empty buffer
+        if valid_limit == 0:
+            return
 
-            # images: gather by (t,b) then produce tensor [mb, C, H, W]
-            if self.images is not None:
-                imgs_batch = self.images[t_idx, b_idx]  # [mb, C, H, W]
-                images_tensor = torch.tensor(imgs_batch, device=self.device, dtype=torch.float32)
-            else:
-                images_tensor = None
+        for start in range(0, total_envs, mini_batch_size):
+            end = start + mini_batch_size
+            mb_indices = indices[start:end]
+
+            # Helper to slice data: [T, B, N, ...] -> [valid_limit, mb_size, N, ...]
+            def prepare(data):
+                if data is None: return None
+                # Slice time to valid_limit (0 to valid_limit)
+                # Slice batch to mb_indices
+                return torch.tensor(data[:valid_limit, mb_indices], device=self.device, dtype=torch.float32)
+
+            # For RNN, we need the INITIAL hidden state at t=0 for the selected envs.
+            # self.init_slot_hidden should be shape [B, N, H]
+            init_slot = None
+            if self.init_slot_hidden is not None:
+                # Slice axis 0 because init_hidden is [B, N, H] corresponding to envs
+                # We do NOT slice time here because this is the state at t=0
+                init_slot = torch.tensor(self.init_slot_hidden[mb_indices],
+                                         device=self.device, dtype=torch.float32)
+
+            init_bev = None
+            if self.init_bev_hidden is not None:
+                init_bev = torch.tensor(self.init_bev_hidden[mb_indices],
+                                        device=self.device, dtype=torch.float32)
 
             yield {
-                "images": images_tensor,
-                "agent_feats": torch.tensor(feats_mb, device=self.device, dtype=torch.float32),
-                "type_id": torch.tensor(types_mb, device=self.device, dtype=torch.long),
-                "actions": torch.tensor(actions_mb, device=self.device, dtype=torch.float32),
-                "old_logp": torch.tensor(old_logp_mb, device=self.device, dtype=torch.float32),
-                "returns": torch.tensor(returns_mb, device=self.device, dtype=torch.float32),
-                "advantages": torch.tensor(adv_mb, device=self.device, dtype=torch.float32),
-                "values": torch.tensor(values_mb, device=self.device, dtype=torch.float32),
-                "indices": batch_idx
+                "images": prepare(self.images),
+                "agent_feats": prepare(self.agent_feats),
+                "type_id": prepare(self.type_id),
+                "actions": prepare(self.actions),
+                "logp": prepare(self.logp),
+                "returns": prepare(self.returns),
+                "advantages": prepare(self.advantages),
+                "values": prepare(self.values),
+                "masks": prepare(self.masks),
+                "pre_t": prepare(self.pre_t),
+
+                # Correctly sliced hidden states
+                "init_slot_hidden": init_slot,
+                "init_bev_hidden": init_bev
             }
+    # def feed_forward_generator(self):
+    #
+    #     images = torch.tensor(self.images, device=self.device) if self.images is not None else None
+    #     agent_feats = torch.tensor(self.agent_feats, device=self.device)
+    #     type_id = torch.tensor(self.type_id, device=self.device)
+    #     actions = torch.tensor(self.actions, device=self.device)
+    #     logp = torch.tensor(self.logp, device=self.device)
+    #     returns = torch.tensor(self.returns, device=self.device)
+    #     advantages = torch.tensor(self.advantages, device=self.device)
+    #     values = torch.tensor(self.values, device=self.device)
+    #     masks = torch.tensor(self.masks, device=self.device)
+    #     pre_t = torch.tensor(self.pre_t, device=self.device)
+    #
+    #     if self.slot_hidden is not None:
+    #         init_slot = torch.tensor(self.slot_hidden[0], device=self.device)
+    #     else:
+    #         init_slot = None
+    #
+    #     if self.bev_hidden is not None:
+    #         init_bev = torch.tensor(self.bev_hidden[0], device=self.device)
+    #     else:
+    #         init_bev = None
+    #
+    #     yield {
+    #         "images": images,
+    #         "agent_feats": agent_feats,
+    #         "type_id": type_id,
+    #         "actions": actions,
+    #         "logp": logp,
+    #         "returns": returns,
+    #         "advantages": advantages,
+    #         "values": values,
+    #         "masks": masks,
+    #         "pre_t": pre_t,
+    #         "init_slot_hidden": init_slot,
+    #         "init_bev_hidden": init_bev
+    #     }
 
     def clear(self):
-        """Reset pointer/flags and zero buffers (safety)."""
         self.ptr = 0
         self.full = False
         if self.images is not None:
@@ -261,10 +313,13 @@ class RolloutBuffer:
         self.values.fill(0)
         self.rewards.fill(0)
         self.masks.fill(1.0)
+        self.pre_t.fill(0)
         self.advantages.fill(0)
         self.returns.fill(0)
 
-    # helpers
+        self.init_slot_hidden = None
+        self.init_bev_hidden = None
+
     def remaining(self) -> int:
         return self.T - self.ptr
 
@@ -275,3 +330,8 @@ class RolloutBuffer:
             "device": str(self.device),
             "has_images": self.images is not None
         }
+
+    def set_initial_hidden(self, slot_hidden, bev_hidden):
+        self.init_slot_hidden = slot_hidden
+        self.init_bev_hidden = bev_hidden
+

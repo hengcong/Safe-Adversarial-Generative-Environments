@@ -90,6 +90,13 @@ class BEVObservation:
             "speed": speed_norm,      # shape (1,)
             "time_stamp": self.time_stamp
         }
+        # ensure bev_float is H x W x C float32 in [0,1] and RGB
+        self.information = {"image": bev_float, "speed": speed_norm, "time_stamp": self.time_stamp}
+        # write canonical cache on env (minimal, safe)
+        try:
+            env.latest_bev_image = bev_float
+        except Exception:
+            pass
         return self.information
 
     def destroy(self, env=None):

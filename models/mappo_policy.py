@@ -6,10 +6,10 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
-_LOG_2PI = math.log(2.0 * math.pi)
+_LOG_2PI = float(torch.log(torch.tensor(2.0 * torch.pi)))
+_EPS = 1e-8
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
-_EPS = 1e-8
 
 # reuse the BEV and SlotGRU implementations you have (or will add)
 from .bev_feature_extractor import BEVFeatureExtractor
@@ -55,8 +55,8 @@ class MAPPOPolicy(nn.Module):
                  # SAGE / environment specific
                  bev_in_ch: int,
                  obs_dim: int,
-                 act_dim_vehicle= 4,
-                 act_dim_ped: Optional[int] = 4,
+                 act_dim_vehicle= 2,
+                 act_dim_ped: Optional[int] = 2,
 
                  # basic MAPPO elements
                  type_vocab_size: int = 2,
@@ -68,8 +68,8 @@ class MAPPOPolicy(nn.Module):
                  global_ctx_dim: int = 256,
 
                  # algorithmic / training controls
-                 action_scale: float = 1.0,
-                 log_std_init: float = -0.5,
+                 action_scale: float = 5.0,
+                 log_std_init: float = -1.5,
 
                  # misc / engineering
                  device: str = "cpu") -> None:
@@ -82,7 +82,12 @@ class MAPPOPolicy(nn.Module):
         # -------------------------
         self.device = torch.device(device)
         # action scale and initial log_std are algorithmic knobs (trainer controls these)
-        self.action_scale = float(action_scale)
+        self.action_scale = torch.as_tensor(
+            action_scale,
+            dtype=torch.float32,
+            device=self.device
+        )
+
         self.log_std_init = float(log_std_init)
 
         # dims & flags
@@ -238,32 +243,19 @@ class MAPPOPolicy(nn.Module):
         # (you can also update save() instead; setting act_dim attr keeps backward compat)
         self.act_dim = max(self.act_dim_vehicle, self.act_dim_ped)
 
-    def forward(self,
-                obs: Dict[str, torch.Tensor],
-                slot_hidden: Optional[torch.Tensor] = None,
-                bev_hidden: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None,
-                mode: str = "seq",
-                deterministic: bool = False) -> Dict[str, torch.Tensor]:
-        """
-        Unified forward:
-         - obs: dict with keys "image", "agent_feats", optional "type_id"
-           image: step -> [B,C,H,W] or [1,B,C,H,W] or seq -> [T,B,C,H,W] or [B,T,C,H,W]
-           agent_feats: step -> [B,N,obs_dim] or [1,B,N,obs_dim] or seq -> [T,B,N,obs_dim] or [B,T,N,obs_dim]
-           type_id: [B,N] or [T,B,N] etc.
-         - slot_hidden: either [B,N,H] (preferred) or full seq [T,B,N,H] (then we take last time as init)
-         - bev_hidden: [B,bev_h] or other form (passed through)
-         - mask: step -> [B,N] or [1,B,N]; seq -> [T,B,N] or [B,T,N]
-         - mode: "seq" or "step"
-         - deterministic: if True, uses mu (no sampling)
-        Returns a dict with (time-major if seq): mu, log_std, pre_tanh, actions, log_probs, values,
-        next_slot_hidden, next_bev_hidden
-        """
+    def forward(
+            self,
+            obs: Dict[str, torch.Tensor],
+            slot_hidden: Optional[torch.Tensor] = None,
+            bev_hidden: Optional[torch.Tensor] = None,
+            mask: Optional[torch.Tensor] = None,
+            mode: str = "seq",
+            deterministic: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         assert mode in ("seq", "step"), "mode must be 'seq' or 'step'"
 
-        # --- extract tensors from obs ---
         image = obs.get("image", None)
-        agent_feats = obs.get("agent_feats", None)  #note: other values in obs dict, like speed or other values
+        agent_feats = obs.get("agent_feats", None)
         type_id = obs.get("type_id", None)
 
         if image is None or agent_feats is None:
@@ -271,62 +263,40 @@ class MAPPOPolicy(nn.Module):
 
         is_step = (mode == "step")
 
-        # --- normalize possible batch-major inputs to time-major [T, B, ...] ---
-        # image: handle shapes [B,C,H,W], [1,B,C,H,W], [T,B,C,H,W], [B,T,C,H,W]
+        # --- normalize image to time-major [T,B,C,H,W] ---
         if is_step:
             if image.dim() == 4:  # [B,C,H,W]
                 image = image.unsqueeze(0)  # -> [1,B,C,H,W]
             elif image.dim() == 5 and image.shape[0] != 1 and image.shape[1] == 1:
-                # rare: [B,1,C,H,W] treat as step -> swap to [1,B,C,H,W]
                 image = image.transpose(0, 1)
         else:
-            # seq mode: accept [T,B,C,H,W] or [B,T,C,H,W]
-            if image.dim() == 5 and image.shape[0] == image.shape[1]:
-                # unlikely but guard
-                pass
-            if image.dim() == 5 and image.shape[0] != 1 and image.shape[1] != 1:
-                # assume either [T,B,...] already OK or [B,T,...]
-                # heuristics: if first dim == batch size? user should ensure distinct B and T.
-                # If first dim looks like batch (==B) while second small (==T), detect by comparing to agent_feats below
-                # We'll standardize by checking agent_feats too
-                pass
-            # If user provided [B,T,C,H,W], detect because agent_feats will likely be [B,T,N,obs]
-            if image.dim() == 5 and agent_feats.dim() == 4 and agent_feats.shape[0] == image.shape[0]:
-                # treat as [B,T,...] -> transpose to [T,B,...]
-                image = image.transpose(0, 1)
+            if image.dim() == 5 and agent_feats is not None and agent_feats.dim() == 4:
+                if agent_feats.shape[0] == image.shape[0] and agent_feats.shape[1] == image.shape[1]:
+                    image = image.transpose(0, 1)
 
-        # agent_feats: handle [B,N,obs] / [1,B,N,obs] / [T,B,N,obs] / [B,T,N,obs]
+        # --- normalize agent_feats to time-major [T,B,N,feat] ---
         if is_step:
-            if agent_feats.dim() == 3:  # [B,N,obs]
-                agent_feats = agent_feats.unsqueeze(0)  # -> [1,B,N,obs]
+            if agent_feats.dim() == 3:  # [B,N,feat]
+                agent_feats = agent_feats.unsqueeze(0)
             elif agent_feats.dim() == 4 and agent_feats.shape[0] != 1 and agent_feats.shape[1] == 1:
                 agent_feats = agent_feats.transpose(0, 1)
         else:
-            # if agent_feats is [B,T,N,obs] -> transpose
-            if agent_feats.dim() == 4 and agent_feats.shape[0] != 1 and agent_feats.shape[1] != 1:
-                # decide if it's [B,T,...] by comparing with image dims
-                if image.dim() == 5 and agent_feats.shape[0] == image.shape[1]:
-                    agent_feats = agent_feats.transpose(0, 1)  # -> [T,B,N,obs]
-                elif agent_feats.shape[0] == image.shape[0]:
-                    # probably already [T,B,N,obs]
-                    pass
+            if agent_feats.dim() == 4 and image.dim() == 5:
+                if agent_feats.shape[0] == image.shape[1]:
+                    agent_feats = agent_feats.transpose(0, 1)
 
-        # type_id normalization: if provided and batch-major [B,N] or [B,T,N], move to [T,B,N]
+        # --- normalize type_id to [T,B,N] if provided ---
         if type_id is not None:
             if is_step:
-                if type_id.dim() == 2:  # [B,N]
-                    type_id = type_id.unsqueeze(0)  # -> [1,B,N]
-            else:
-                if type_id.dim() == 2:  # [B,N] broadcast over T
+                if type_id.dim() == 2:
                     type_id = type_id.unsqueeze(0)
-                elif type_id.dim() == 3 and type_id.shape[0] == agent_feats.shape[1]:
-                    # already [T,B,N]
-                    pass
-                elif type_id.dim() == 3 and type_id.shape[1] == agent_feats.shape[0]:
-                    # maybe [B,T,N] -> transpose
+            else:
+                if type_id.dim() == 2:
+                    type_id = type_id.unsqueeze(0)
+                elif type_id.dim() == 3 and image is not None and type_id.shape[0] == image.shape[1]:
                     type_id = type_id.transpose(0, 1)
 
-        # mask normalization: accept [B,N] or [1,B,N] or [T,B,N] or [B,T,N]
+        # --- normalize mask to [T,B,N] if provided ---
         if mask is not None:
             if is_step:
                 if mask.dim() == 2:
@@ -334,14 +304,12 @@ class MAPPOPolicy(nn.Module):
                 elif mask.dim() == 3 and mask.shape[0] != 1 and mask.shape[1] == 1:
                     mask = mask.transpose(0, 1)
             else:
-                if mask.dim() == 2:  # [B,N] -> broadcast
+                if mask.dim() == 2:
                     mask = mask.unsqueeze(0)
-                elif mask.dim() == 3 and mask.shape[0] == agent_feats.shape[1]:
-                    # [B,T,N] -> transpose
+                elif mask.dim() == 3 and image is not None and mask.shape[0] == image.shape[1]:
                     mask = mask.transpose(0, 1)
 
-        # Now ensure final shapes:
-        # image: [T,B,C,H,W], agent_feats: [T,B,N,obs], mask: [T,B,N] (or None), type_id: [T,B,N] or None
+        # final shape checks
         if image.dim() != 5:
             raise ValueError(f"image should be 5D after normalization, got {image.shape}")
         if agent_feats.dim() != 4:
@@ -349,75 +317,125 @@ class MAPPOPolicy(nn.Module):
 
         T, B = image.shape[0], image.shape[1]
         _, _, N, obs_dim = agent_feats.shape
+
         # --- slot_hidden normalization ---
-        # Accept slot_hidden either as [B,N,H] or full seq [T,B,N,H] (we use last as initial)
         if slot_hidden is None or bev_hidden is None:
             slot_hidden, bev_hidden = self.get_initial_hidden(batch_size=B, n_agent=N)
         else:
             if slot_hidden.dim() == 4:
-                # [T,B,N,H] -> take last time-step as initial
                 slot_hidden = slot_hidden[-1]
-            # ensure shape [B,N,H]
             if slot_hidden.dim() != 3:
                 raise ValueError("slot_hidden must be [B,N,H] or [T,B,N,H]")
 
-        # bev_hidden can be passed through as-is, allow [B, ...] or [T,B,...] similar logic if needed
         if bev_hidden is not None and bev_hidden.dim() == 4:
             bev_hidden = bev_hidden[-1]
 
-        # --- prepare containers for time-major outputs ---
+        # --- precompute BEV embeddings for seq mode with robust normalization ---
+        bev_embed_seq = None
+        if not is_step:
+            bev_out = self._call_bev_encoder_seq(image, bev_hidden) if hasattr(self,
+                                                                               "_call_bev_encoder_seq") else self.bev_enc(
+                image
+            )
+
+            if isinstance(bev_out, tuple) and len(bev_out) == 2:
+                bev_embed_seq, bev_h = bev_out
+            else:
+                bev_embed_seq = bev_out
+
+            if not torch.is_tensor(bev_embed_seq):
+                bev_embed_seq = torch.as_tensor(bev_embed_seq, device=image.device)
+
+            if bev_embed_seq.dim() == 2:
+                if bev_embed_seq.shape[0] == T * B:
+                    bev_embed_seq = bev_embed_seq.contiguous().view(T, B, -1)
+                elif bev_embed_seq.shape[0] == T:
+                    bev_embed_seq = bev_embed_seq.contiguous().view(T, 1, -1).expand(T, B, -1).contiguous()
+                else:
+                    bev_embed_seq = bev_embed_seq.contiguous().view(T, B, -1)
+            elif bev_embed_seq.dim() == 3:
+                if bev_embed_seq.shape[0] == T:
+                    pass
+                elif bev_embed_seq.shape[1] == T:
+                    bev_embed_seq = bev_embed_seq.transpose(0, 1).contiguous()
+                else:
+                    bev_embed_seq = bev_embed_seq.contiguous().view(T, B, -1)
+            else:
+                bev_embed_seq = bev_embed_seq.contiguous().view(T, B, -1)
+
+        # --- prepare outputs ---
         mus = []
         log_stds = []
         pre_tanz = []
         actions_out = []
         log_probs = []
         values_out = []
+        entropies = []
 
-        slot_h = slot_hidden  # [B,N,H]
+        slot_h = slot_hidden
         bev_h = bev_hidden
 
-        # Loop over time. Replace this loop with vectorized seq calls if your submodules support it.
         for t in range(T):
             img_t = image[t]  # [B,C,H,W]
             feat_t = agent_feats[t]  # [B,N,obs]
             mask_t = mask[t] if mask is not None else torch.ones(B, N, device=feat_t.device)
             type_t = type_id[t] if type_id is not None else None
 
-            # --- BEV encoder step (TODO: implement) ---
-            # expect bev_embed [B, D] (or [B, N, D] if per-agent) and next bev_h
-            bev_embed, bev_h = self._call_bev_encoder_step(img_t, bev_h)
+            # BEV embedding per-step (ensure shape [B,D])
+            if is_step:
+                bev_embed, bev_h = self._call_bev_encoder_step(img_t, bev_h)
+                if not torch.is_tensor(bev_embed):
+                    bev_embed = torch.as_tensor(bev_embed, device=img_t.device)
+                if bev_embed.dim() == 1:
+                    bev_embed = bev_embed.unsqueeze(0)
+                if bev_embed.dim() == 2 and bev_embed.shape[0] != B:
+                    if bev_embed.shape[0] == 1 and B > 1:
+                        bev_embed = bev_embed.expand(B, bev_embed.shape[-1]).contiguous()
+                    else:
+                        bev_embed = bev_embed.contiguous().view(B, -1)
+            else:
+                bev_embed = bev_embed_seq[t]
+                if not torch.is_tensor(bev_embed):
+                    bev_embed = torch.as_tensor(bev_embed, device=img_t.device)
+                if bev_embed.dim() == 1:
+                    bev_embed = bev_embed.unsqueeze(0)
+                if bev_embed.dim() == 2 and bev_embed.shape[0] != B:
+                    if bev_embed.shape[0] == T and B == 1:
+                        bev_embed = bev_embed[0].unsqueeze(0)
+                    else:
+                        bev_embed = bev_embed.contiguous().view(B, -1)
 
-            # --- SlotGRU step (TODO: implement) ---
-            # slot_emb: [B,N,slot_dim], slot_h: updated hidden [B,N,H]
+            # slot GRU step
             slot_emb, slot_h = self._call_slot_gru_step(feat_t, slot_h, bev_embed, mask_t)
 
-            # --- Actor head (type-conditioned) (TODO) ---
-            # mu, log_std: [B,N,act_dim]
+            # actor head
             mu_t, log_std_t = self._call_actor_head(slot_emb, type_t)
 
-            # --- sample or deterministic pre-tanh ---
+            # compute std and entropy
+            std = torch.exp(log_std_t)
+            dist = torch.distributions.Normal(mu_t, std)
+            entropy_t = dist.entropy().sum(dim=-1)  # [B,N]
+
+            # sample/deterministic
             if deterministic:
                 pre_t = mu_t
             else:
-                std = torch.exp(log_std_t)
                 eps = torch.randn_like(mu_t)
                 pre_t = mu_t + eps * std
 
-            action_t = torch.tanh(pre_t)  # [B,N,act_dim]
+            action_t = torch.tanh(pre_t) * self.action_scale
 
-            # --- log_prob (gaussian + tanh jacobian) ---
-            logprob_t = self._call_logprob(pre_t, mu_t, log_std_t)  # returns [B,N] summed over act-dim
-
-            # --- critic per-agent (TODO) ---
-
+            # log prob
+            logprob_t = self._call_logprob(pre_t, mu_t, log_std_t, action_scale=self.action_scale)
+            # critic
             v_t = self._call_critic(slot_emb, feat_t, bev_embed, mask_t)
 
-            # apply mask to zero-out dead agents where appropriate
-            mask_t_ = mask_t.unsqueeze(-1)  # [B,N,1]
+            # mask out inactive agents
+            mask_t_ = mask_t.unsqueeze(-1)
             v_t = v_t * mask_t_
             action_t = action_t * mask_t_.expand_as(action_t)
-            # optionally zero logprob for inactive agents:
             logprob_t = logprob_t * mask_t
+            entropy_t = entropy_t * mask_t
 
             # collect
             mus.append(mu_t.unsqueeze(0))
@@ -426,14 +444,20 @@ class MAPPOPolicy(nn.Module):
             actions_out.append(action_t.unsqueeze(0))
             log_probs.append(logprob_t.unsqueeze(0))
             values_out.append(v_t.unsqueeze(0))
+            entropies.append(entropy_t.unsqueeze(0))
 
-        # stack time-major
-        mu = torch.cat(mus, dim=0)  # [T,B,N,act_dim]
+        # stack
+        mu = torch.cat(mus, dim=0)
         log_std = torch.cat(log_stds, dim=0)
         pre_tanh = torch.cat(pre_tanz, dim=0)
         actions = torch.cat(actions_out, dim=0)
-        log_probs = torch.cat(log_probs, dim=0)  # [T,B,N]
-        values = torch.cat(values_out, dim=0)  # [T,B,N,1]
+        log_probs = torch.cat(log_probs, dim=0)
+        values = torch.cat(values_out, dim=0)
+        entropy = torch.cat(entropies, dim=0)
+
+        # ensure values shape [T,B,N] if last dim==1
+        if values.dim() == 4 and values.shape[-1] == 1:
+            values = values.squeeze(-1)
 
         outputs = {
             "mu": mu,
@@ -442,11 +466,11 @@ class MAPPOPolicy(nn.Module):
             "actions": actions,
             "log_probs": log_probs,
             "values": values,
-            "next_slot_hidden": slot_h,  # [B,N,H]
-            "next_bev_hidden": bev_h  # [B,...]
+            "entropy": entropy,
+            "next_slot_hidden": slot_h,
+            "next_bev_hidden": bev_h,
         }
 
-        # if step mode, squeeze the time dim
         if is_step:
             def _squeeze0(x):
                 return x.squeeze(0) if torch.is_tensor(x) and x.shape[0] == 1 else x
@@ -533,69 +557,64 @@ class MAPPOPolicy(nn.Module):
         return next_slot, next_bev
 
     def select_action(self,
-                      obs_step: Dict[str, torch.Tensor],
-                      slot_hidden: Optional[torch.Tensor] = None,
-                      bev_hidden: Optional[torch.Tensor] = None,
-                      mask: Optional[torch.Tensor] = None,
-                      deterministic: bool = False):
-        """
-        Single-step sampling wrapper that reuses forward(..., mode='step').
+                      obs_step,
+                      slot_hidden=None,
+                      bev_hidden=None,
+                      mask=None,
+                      deterministic=False):
 
-        Returns:
-          actions: torch.Tensor [B,N,2]  (throttle, steer)
-          values:  torch.Tensor [B,N,1]
-          log_probs: torch.Tensor [B,N]
-          next_slot_hidden: torch.Tensor [B,N,H] or None
-          next_bev_hidden: torch.Tensor or None
-          info: dict (mu, log_std, pre_tanh)
-        """
-        # call forward in step mode (no grad)
+        device = next(self.parameters()).device
+
         with torch.no_grad():
-            out = self.forward(obs=obs_step,
-                               slot_hidden=slot_hidden,
-                               bev_hidden=bev_hidden,
-                               mask=mask,
-                               mode="step",
-                               deterministic=deterministic)
+            out = self.forward(
+                obs=obs_step,
+                slot_hidden=slot_hidden,
+                bev_hidden=bev_hidden,
+                mask=mask,
+                mode="step",
+                deterministic=deterministic
+            )
 
-        # get commonly returned items
-        mu = out.get("mu")  # expected shape [B,N,A_net]
-        log_std = out.get("log_std")  # [B,N,A_net]
-        values = out.get("values", out.get("value"))  # [B,N,1] or [B,N]
-        next_slot_hidden = out.get("next_slot_hidden", out.get("slot_hidden", None))
-        next_bev_hidden = out.get("next_bev_hidden", out.get("bev_hidden", None))
+        mu = out["mu"]
+        log_std = out["log_std"]
+        values = out.get("values", out.get("value"))
+        next_slot_hidden = out.get("next_slot_hidden", None)
+        next_bev_hidden = out.get("next_bev_hidden", None)
 
-        info = {
-            "mu": mu,
-            "log_std": log_std,
-            "pre_tanh": None
-        }
-
-        # minimal required: mu and log_std must exist
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         std = torch.exp(log_std)
 
-        # sampling or deterministic
         if deterministic:
             pre_t = mu
         else:
             eps = torch.randn_like(mu)
             pre_t = mu + eps * std
 
-        # log-prob without tanh-correction (simple)
-        dist = torch.distributions.Normal(mu, std)
-        logp = dist.log_prob(pre_t).sum(dim=-1)  # [B,N]
+        tanh_pre = torch.tanh(pre_t)
 
-        # squash to (-1,1)
-        pre_t_squashed = torch.tanh(pre_t)
-        info["pre_tanh"] = pre_t_squashed
+        action_scale = getattr(self, "action_scale", 1.0)
+        action_scale_t = torch.as_tensor(
+            action_scale, device=device, dtype=tanh_pre.dtype
+        )
 
-        # only keep first two dims: throttle, steer
-        a_trim = pre_t_squashed[..., :2]  # [B,N,2]
+        action_scaled = tanh_pre * action_scale_t
 
-        # map throttle (-1,1) -> (0,1), steer keep (-1,1)
-        throttle = (a_trim[..., 0] + 1.0) / 2.0
+        a_trim = action_scaled[..., :2]
+
+        a0_unscaled = a_trim[..., 0] / (action_scale_t + _EPS)
+        throttle = (a0_unscaled + 1.0) / 2.0
         steer = a_trim[..., 1]
-        actions = torch.stack([throttle, steer], dim=-1)  # [B,N,2]
+
+        actions = torch.stack([throttle, steer], dim=-1)
+        actions[..., 0] = actions[..., 0].clamp(0.0, 1.0)
+
+        logp = self._call_logprob(pre_t, mu, log_std, action_scale=action_scale_t)
+
+        info = {
+            "mu": mu,
+            "log_std": log_std,
+            "pre_t": pre_t
+        }
 
         return actions, values, logp, next_slot_hidden, next_bev_hidden, info
 
@@ -780,50 +799,77 @@ class MAPPOPolicy(nn.Module):
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.to(self.device)
 
-    # ---------------------------
-    # Placeholder helpers: replace with your actual submodule calls
-    # ---------------------------
     def _call_bev_encoder_step(self, img_t, bev_h):
         """
         img_t: [B, C, H, W]
         bev_h: previous bev hidden (or None)
-
-        Returns:
-          bev_embed: [B, D] (D == self.bev_feat_dim)
-          next_bev_h: whatever bev_enc.step/forward returns as next hidden (or bev_h if none)
+        Return:
+          bev_embed: [B, D]
+          next_bev_h
         """
         device = img_t.device
+        B = img_t.shape[0]
 
-        # prefer explicit step API if exists (most efficient for collector)
-        if hasattr(self.bev_enc, "step"):
-            # some BEV encoders return (bev_embed, next_h), others just bev_embed
-            out = self.bev_enc.step(img_t, bev_h)  # expect one or two returns
-            if isinstance(out, tuple) and len(out) == 2:
-                bev_embed, next_bev_h = out
-            else:
-                bev_embed = out
-                next_bev_h = bev_h
-        else:
-            # fallback to calling forward; handle batch/time dims robustly
-            # assume forward expects [B,C,H,W] -> returns [B, D] or ([B,D], next_h)
+        # Always call encoder on the single timestep input (force step-like behavior)
+        # Do NOT rely on a `step()` API that might internally use cached full sequences.
+        out = None
+        try:
             out = self.bev_enc(img_t)
-            if isinstance(out, tuple) and len(out) == 2:
-                bev_embed, next_bev_h = out
+        except Exception:
+            # as a last resort, if bev_enc has step, call it
+            if hasattr(self.bev_enc, "step"):
+                out = self.bev_enc.step(img_t, bev_h)
             else:
-                bev_embed = out
-                next_bev_h = bev_h
+                out = self.bev_enc(img_t)
 
-        # safety: ensure correct dim
+        if isinstance(out, tuple) and len(out) == 2:
+            bev_embed, next_bev_h = out
+        else:
+            bev_embed = out
+            next_bev_h = bev_h
+
+        # normalize to [B, D]
         if bev_embed is None:
-            B = img_t.shape[0]
             D = getattr(self, "bev_feat_dim", 256)
             bev_embed = torch.zeros(B, D, device=device)
-            next_bev_h = bev_h
+        else:
+            # if returned flattened time*batch (T*B, D), try to reshape and select first batch slice
+            if bev_embed.dim() == 2 and bev_embed.shape[0] != B:
+                if bev_embed.shape[0] % B == 0:
+                    TB = bev_embed.shape[0]
+                    T = TB // B
+                    bev_embed = bev_embed.view(T, B, bev_embed.shape[-1])[0]  # take t=0
+                else:
+                    # fallback: take first B rows
+                    bev_embed = bev_embed[:B]
+            # if higher-dim, reshape to [B, -1]
+            if bev_embed.dim() != 2:
+                bev_embed = bev_embed.reshape(B, -1)
 
         return bev_embed, next_bev_h
 
+    def _call_bev_encoder_seq(self, image_seq, bev_h):
+        """
+        image_seq: [T, B, C, H, W]
+        return: [T, B, D]
+        """
+
+        T, B = image_seq.shape[0], image_seq.shape[1]
+
+        # reshape to 4D for CNN
+        img_flat = image_seq.view(T * B, image_seq.shape[2], image_seq.shape[3], image_seq.shape[4])
+
+        bev_flat = self.bev_enc(img_flat)  # [T*B, D]
+
+        # ensure 2D
+        if bev_flat.dim() != 2:
+            bev_flat = bev_flat.view(T * B, -1)
+
+        bev_embed_seq = bev_flat.view(T, B, -1)
+
+        return bev_embed_seq, bev_h
+
     def _call_slot_gru_step(self, feat_t, slot_h, bev_embed, mask_t):
-        import torch
 
         dev = next(self.parameters()).device
 
@@ -872,8 +918,8 @@ class MAPPOPolicy(nn.Module):
         slot_input = torch.cat(pieces, dim=-1)  # [B*N, total_dim]
         total_dim = slot_input.shape[1]
 
+        # ensure slot_input matches expected input size (existing code kept)
         expected_in = None
-        # try to obtain expected input size from slot_gru
         try:
             expected_in = int(
                 getattr(self.slot_gru, "input_size", None) or getattr(self.slot_gru, "gru_cell").input_size)
@@ -892,13 +938,147 @@ class MAPPOPolicy(nn.Module):
                     f"feat_t={tuple(feat_t.shape)}, bev_embed={tuple(bev_embed.shape)}, mask_t={tuple(mask_t.shape)}"
                 )
 
-        slot_emb, next_slot_h = self.slot_gru.step(slot_input, slot_h, mask_t)
+        # --- Prepare flattened hidden and mask so they match slot_input batch dim [B*N, ...] ---
+        # Normalize slot_h to flat [B*N, H]
+        if slot_h is None:
+            # 初始化 hidden
+            H = getattr(self, "slot_hidden_dim", None)
+            if H is None:
+                # 从 gru_cell 读 hidden_size
+                try:
+                    H = self.slot_gru.gru_cell.hidden_size
+                except Exception:
+                    raise RuntimeError("Cannot infer slot hidden size")
+            slot_h_flat = torch.zeros(B * N, H, device=dev, dtype=slot_input.dtype)
 
-        if isinstance(slot_emb, torch.Tensor) and slot_emb.dim() == 2:
-            H = slot_emb.shape[1]
-            slot_emb = slot_emb.view(B, N, H)
+        else:
+
+            if slot_h.dim() == 3:
+                if slot_h.shape[1] == N:
+                    # If it's a single-sequence hidden state, expand it
+                    if slot_h.shape[0] == 1 and B > 1:
+                        slot_h = slot_h.expand(B, -1, -1).contiguous()
+
+                    # Use the actual batch size of the tensor
+                    curr_batch_size = slot_h.shape[0]
+                    slot_h_flat = slot_h.view(curr_batch_size * N, -1)
+                else:
+                    raise RuntimeError(
+                        f"slot_h agents mismatch: got {slot_h.shape[1]}, expected {N}"
+                    )
+                # # 情况1: 正常 [B, N, H]
+                # if tuple(slot_h.shape[:2]) == (B, N):
+                #     slot_h_flat = slot_h.view(B * N, -1)
+                #
+                # # 情况2: rollout阶段常见 [1, N, H] → 需要 expand 到 [B,N,H]
+                # elif slot_h.shape[0] == 1 and slot_h.shape[1] == N:
+                #     slot_h = slot_h.expand(B, -1, -1).contiguous()
+                #     slot_h_flat = slot_h.view(B * N, -1)
+                #
+                # else:
+                #     raise RuntimeError(
+                #         f"slot_h shape mismatch: got {tuple(slot_h.shape)} expected (B,N,H)=({B},{N},H)"
+                #     )
+
+            elif slot_h.dim() == 2 and slot_h.shape[0] == B * N:
+                slot_h_flat = slot_h
+
+            else:
+                raise RuntimeError(
+                    f"Unable to flatten slot_h with shape {tuple(slot_h.shape)}"
+                )
+
+        # Normalize mask: keep both forms: mask_2d [B,N] and mask_flat [B*N]
+        mask_2d = None
+        mask_flat = None
+        if mask_t is None:
+            mask_2d = torch.ones(B, N, device=dev, dtype=slot_input.dtype)
+            mask_flat = mask_2d.reshape(B * N)
+        else:
+            if mask_t.dim() == 2 and tuple(mask_t.shape) == (B, N):
+                mask_2d = mask_t
+                mask_flat = mask_t.reshape(B * N)
+            elif mask_t.dim() == 1 and mask_t.shape[0] == B * N:
+                mask_flat = mask_t
+                mask_2d = mask_t.view(B, N)
+            else:
+                # try to coerce
+                try:
+                    if mask_t.numel() == B * N:
+                        mask_flat = mask_t.view(B * N)
+                        mask_2d = mask_flat.view(B, N)
+                    else:
+                        raise RuntimeError(f"mask_t has incompatible numel {mask_t.numel()} vs B*N {B*N}")
+                except Exception as e:
+                    raise RuntimeError(f"mask_t shape not compatible: {tuple(mask_t.shape)}") from e
+
+        # Try calling slot_gru.step with common candidate signatures robustly
+        call_errors = []
+        slot_emb_flat = None
+        next_slot_h_out = None
+
+        # Candidate 1: (slot_input, slot_h_flat, mask_flat) -> most likely
+        try:
+            slot_emb_flat, next_slot_h_out = self.slot_gru.step(slot_input, slot_h_flat, mask_flat)
+        except Exception as e1:
+            call_errors.append(("flat_h, flat_mask", e1))
+            # Candidate 2: (slot_input, slot_h_flat, mask_2d)
+            try:
+                slot_emb_flat, next_slot_h_out = self.slot_gru.step(slot_input, slot_h_flat, mask_2d)
+            except Exception as e2:
+                call_errors.append(("flat_h, 2d_mask", e2))
+                # Candidate 3: (slot_input, slot_h, mask_flat) where slot_h is 3D [B,N,H]
+                try:
+                    slot_emb_flat, next_slot_h_out = self.slot_gru.step(slot_input, slot_h, mask_flat)
+                except Exception as e3:
+                    call_errors.append(("3d_h, flat_mask", e3))
+                    # Candidate 4: (slot_input, slot_h, mask_2d)
+                    try:
+                        slot_emb_flat, next_slot_h_out = self.slot_gru.step(slot_input, slot_h, mask_2d)
+                    except Exception as e4:
+                        call_errors.append(("3d_h, 2d_mask", e4))
+                        # All failed → raise a detailed error
+                        err_msgs = "\n".join([f"{k}: {v}" for k, v in call_errors])
+                        raise RuntimeError(
+                            f"[slot_gru.step] all candidate call signatures failed. Diagnostics:\n"
+                            f"B={B}, N={N}, slot_input.shape={tuple(slot_input.shape)}, "
+                            f"slot_h.shape={tuple(slot_h.shape) if slot_h is not None else None}, "
+                            f"mask_2d.shape={tuple(mask_2d.shape) if mask_2d is not None else None}, "
+                            f"mask_flat.shape={tuple(mask_flat.shape) if mask_flat is not None else None}\n"
+                            f"Errors:\n{err_msgs}"
+                        ) from e4
+
+        # --- Normalize outputs to expected shapes [B,N,H] ---
+        if isinstance(slot_emb_flat, torch.Tensor):
+            if slot_emb_flat.dim() == 2 and slot_emb_flat.shape[0] == B * N:
+                H_out = slot_emb_flat.shape[1]
+                slot_emb = slot_emb_flat.view(B, N, H_out)
+            elif slot_emb_flat.dim() == 3 and tuple(slot_emb_flat.shape[:2]) == (B, N):
+                slot_emb = slot_emb_flat
+            else:
+                try:
+                    slot_emb = slot_emb_flat.contiguous().view(B, N, -1)
+                except Exception as e:
+                    raise RuntimeError(f"Unexpected slot_emb_flat shape {tuple(slot_emb_flat.shape)}") from e
+        else:
+            raise RuntimeError("slot_gru.step returned unexpected slot_emb type")
+
+        # next_slot_h_out -> normalize to [B, N, H]
+        if isinstance(next_slot_h_out, torch.Tensor):
+            if next_slot_h_out.dim() == 2 and next_slot_h_out.shape[0] == B * N:
+                next_slot_h = next_slot_h_out.view(B, N, -1)
+            elif next_slot_h_out.dim() == 3 and tuple(next_slot_h_out.shape[:2]) == (B, N):
+                next_slot_h = next_slot_h_out
+            else:
+                try:
+                    next_slot_h = next_slot_h_out.contiguous().view(B, N, -1)
+                except Exception as e:
+                    raise RuntimeError(f"Unexpected next_slot_h_out shape {tuple(next_slot_h_out.shape)}") from e
+        else:
+            raise RuntimeError("slot_gru.step returned unexpected next_slot_h type")
 
         return slot_emb, next_slot_h
+
 
     def _call_actor_head(self, slot_emb, type_t=None):
         """
@@ -909,7 +1089,6 @@ class MAPPOPolicy(nn.Module):
           mu: [B, N, A]
           log_std: [B, N, A]
         """
-        import torch
 
         B, N, H = slot_emb.shape
         device = slot_emb.device
@@ -1078,38 +1257,39 @@ class MAPPOPolicy(nn.Module):
         mu = mu_flat.view(B, N, A)
         log_std = log_std_flat.view(B, N, A)
 
+        log_std = torch.clamp(log_std, -5.0, 2.0)
+
         return mu, log_std
 
-    def _call_logprob(self, pre_t: torch.Tensor, mu: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-          pre_t: [B, N, A]   (pre-tanh samples)
-          mu:    [B, N, A]
-          log_std: [B, N, A]
-        Returns:
-          log_prob: [B, N]   (sum over action dim, with tanh jacobian correction)
-        """
-        # clamp pre_t for numerical stability
+    def _call_logprob(self, pre_t, mu, log_std, action_scale=None):
         pre_t = pre_t.clamp(-20.0, 20.0)
-
-        # clamp log_std for stability
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = torch.exp(log_std)  # [B,N,A]
-        var = std * std
 
-        # gaussian log-prob per-dim: -0.5 * ( (x-mu)^2 / var + 2*log_std + log(2pi) )
+        std = torch.exp(log_std)
+        var = std * std + _EPS
+
         sq = (pre_t - mu) ** 2
-        logp_per_dim = -0.5 * (sq / (var + _EPS) + 2.0 * log_std + _LOG_2PI)  # [B,N,A]
-        logp = logp_per_dim.sum(dim=-1)  # [B,N]
+        logp_per_dim = -0.5 * (sq / var + 2.0 * log_std + _LOG_2PI)
+        logp = logp_per_dim.sum(dim=-1)
 
-        # tanh jacobian correction (stable): sum_dim log(1 - tanh(x)^2)
-        # use identity: log(1 - tanh(x)^2) = 2*(log(2) - x - softplus(-2x))
-        # use a tensor for log(2) so device/dtype match
         log2 = torch.log(torch.tensor(2.0, device=pre_t.device, dtype=pre_t.dtype))
-        correction_per_dim = 2.0 * (log2 - pre_t - F.softplus(-2.0 * pre_t))  # [B,N,A]
-        correction = correction_per_dim.sum(dim=-1)  # [B,N]
+        correction_per_dim = 2.0 * (log2 - pre_t - F.softplus(-2.0 * pre_t))
+        correction = correction_per_dim.sum(dim=-1)
 
-        return logp - correction
+        if action_scale is None:
+            scale_log = 0.0
+        else:
+            action_scale_t = torch.as_tensor(
+                action_scale, device=pre_t.device, dtype=pre_t.dtype
+            )
+            log_abs_scale = torch.log(torch.abs(action_scale_t) + _EPS)
+
+            while log_abs_scale.dim() < pre_t.dim():
+                log_abs_scale = log_abs_scale.unsqueeze(0)
+
+            scale_log = log_abs_scale.sum(dim=-1)
+
+        return logp - correction - scale_log
 
     def _call_critic(self, slot_emb: torch.Tensor, agent_feats: torch.Tensor, bev_embed: Optional[torch.Tensor], mask_t: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -1238,68 +1418,127 @@ class MAPPOPolicy(nn.Module):
 
         return None
 
-    def evaluate_actions(self, obs, actions, *args, **kwargs):
-        """
-        Clean and stable evaluate_actions:
-        - obs MUST be a dict containing at least {'agent_feats': [B,N,F], 'image': [B,C,H,W]}
-        - actions: [B,N,A]
-        - returns a dict with keys: 'log_probs', 'values'
-        """
-
-        import torch
-        import traceback
-
+    def evaluate_actions(self,
+                         obs,
+                         actions,
+                         mask=None,
+                         slot_hidden=None,
+                         bev_hidden=None,
+                         mode="seq",
+                         pre_t=None):  # <--- [Modification 1] Added optional pre_t parameter
+        eps = 1e-6
         device = next(self.parameters()).device
 
-        # -----------------------
-        # validate obs
-        # -----------------------
-        if not isinstance(obs, dict):
-            raise RuntimeError("evaluate_actions: obs must be dict")
-
-        if "agent_feats" not in obs or "image" not in obs:
-            raise RuntimeError("evaluate_actions: obs missing required keys")
-
+        images = obs.get("image", None)
         agent_feats = obs["agent_feats"]
-        image = obs["image"]
-        type_id = obs.get("type_id", None)
 
-        if not isinstance(agent_feats, torch.Tensor):
-            agent_feats = torch.tensor(agent_feats, dtype=torch.float32)
-        if not isinstance(image, torch.Tensor):
-            image = torch.tensor(image, dtype=torch.float32)
-        if isinstance(type_id, list):
-            type_id = torch.tensor(type_id, dtype=torch.long)
+        is_step = False
+        if agent_feats.dim() == 3:
+            agent_feats = agent_feats.unsqueeze(0)
+            is_step = True
+        if images is not None and images.dim() == 4:
+            images = images.unsqueeze(0)
+        if actions.dim() == 3:
+            actions = actions.unsqueeze(0)
+        if mask is not None and mask.dim() == 2:
+            mask = mask.unsqueeze(0)
 
-        agent_feats = agent_feats.to(device)
-        image = image.to(device)
-        if type_id is not None:
-            type_id = type_id.to(device)
+        # [Modification 2] Adjust dimensions for pre_t if provided
+        if pre_t is not None:
+            if pre_t.dim() == 3:  # [B, N, A] -> [1, B, N, A]
+                pre_t = pre_t.unsqueeze(0)
+            pre_t = pre_t.to(device)
 
-        obs = {"agent_feats": agent_feats, "image": image}
-        if type_id is not None:
-            obs["type_id"] = type_id
+        T, B, N, _ = agent_feats.shape
 
-        if not isinstance(actions, torch.Tensor):
-            actions = torch.tensor(actions, dtype=torch.float32)
-        actions = actions.to(device)
+        # Hidden Init
+        if slot_hidden is None or bev_hidden is None:
+            slot_h, bev_h = self.get_initial_hidden(batch_size=B, n_agent=N)
+        else:
+            slot_h = slot_hidden.to(device)
+            bev_h = bev_hidden.to(device)
 
-        # -----------------------
-        # forward pass (no grad)
-        # -----------------------
-        with torch.no_grad():
-            out = self.forward(obs=obs, mode="step", deterministic=False)
+        logp_seq = []
+        value_seq = []
+        entropy_seq = []
+        logstd_seq = []
 
-        if not isinstance(out, dict):
-            raise RuntimeError("evaluate_actions: forward returned non-dict")
+        action_scale = getattr(self, "action_scale", 1.0)
+        action_scale_t = torch.as_tensor(action_scale, device=device, dtype=actions.dtype)
 
-        logp = out.get("log_probs", None)
-        value = out.get("values", None)
+        for t in range(T):
+            feat_t = agent_feats[t].to(device)
+            # act_t = actions[t].to(device) # Not strictly needed for reconstruction if pre_t exists
+            img_t = images[t].to(device) if images is not None else None
+            mask_t = mask[t].to(device) if mask is not None else torch.ones(B, N, device=device)
 
-        if logp is None or value is None:
-            raise RuntimeError(f"evaluate_actions: missing keys in output {out.keys()}")
+            bev_embed, bev_h = self._call_bev_encoder_step(img_t, bev_h)
+            slot_emb, slot_h = self._call_slot_gru_step(feat_t, slot_h, bev_embed, mask_t)
 
-        return {"log_probs": logp, "values": value}
+            actor_out = self.actor(slot_emb)
+            mu = actor_out["mu"]
+            log_std = torch.clamp(actor_out["log_std"], LOG_STD_MIN, LOG_STD_MAX)
+            std = torch.exp(log_std)
+
+            # --- [Modification 3] Core Fix Logic ---
+            if pre_t is not None:
+                # Plan A: Use the stored pre_t directly from buffer (Most robust)
+                pre_t_step = pre_t[t]
+            else:
+                # Plan B: Fallback to reconstruction if pre_t is missing
+                act_t = actions[t].to(device)
+                A_dim = mu.shape[-1]
+                tanh_pre = torch.zeros((B, N, A_dim), device=device, dtype=mu.dtype)
+
+                # Inverse Tanh Logic
+                tanh_pre[..., 0] = act_t[..., 0] * 2.0 - 1.0
+                if A_dim > 1:
+                    tanh_pre[..., 1] = act_t[..., 1] / (action_scale_t + eps)
+
+                # Clamp to prevent NaN
+                tanh_pre = torch.clamp(tanh_pre, -1.0 + eps, 1.0 - eps)
+                pre_t_step = 0.5 * (torch.log1p(tanh_pre) - torch.log1p(-tanh_pre))
+
+            # Calculate LogP
+            logp = self._call_logprob(pre_t_step, mu, log_std, action_scale=action_scale_t)
+
+            dist = torch.distributions.Normal(mu, std)
+            entropy = dist.entropy().sum(dim=-1)
+
+            # Critic
+            bev_ctx = self.bev_to_ctx(bev_embed)
+            bev_ctx_exp = bev_ctx.unsqueeze(1).expand(-1, N, -1)
+            critic_input = torch.cat([slot_emb, bev_ctx_exp], dim=-1)
+            values = self.critic(critic_input)
+            if values.dim() == 3:
+                values = values.squeeze(-1)
+
+            entropy = entropy * mask_t
+            values = values * mask_t
+
+            logp_seq.append(logp.unsqueeze(0))
+            value_seq.append(values.unsqueeze(0))
+            entropy_seq.append(entropy.unsqueeze(0))
+            logstd_seq.append(log_std.unsqueeze(0))
+
+        # Stack output
+        logp_out = torch.cat(logp_seq, dim=0)
+        value_out = torch.cat(value_seq, dim=0)
+        entropy_out = torch.cat(entropy_seq, dim=0)
+        logstd_out = torch.cat(logstd_seq, dim=0)
+
+        if is_step:
+            logp_out = logp_out.squeeze(0)
+            value_out = value_out.squeeze(0)
+            entropy_out = entropy_out.squeeze(0)
+            logstd_out = logstd_out.squeeze(0)
+
+        return {
+            "log_probs": logp_out,
+            "values": value_out,
+            "entropy": entropy_out,
+            "log_std": logstd_out
+        }
 
     def compute_slot_features(self, agent_feats):
         """
