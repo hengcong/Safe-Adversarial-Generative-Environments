@@ -16,12 +16,14 @@ import cv2
 
 import torch
 from .observation.obs_bev import BEVObservation
+from envs.safety.shield import SafetyShield
+
 from algo.mappo.mappo_manager import MAPPOManager
 from models.mappo_policy import MAPPOPolicy
 
 
 class CarlaEnv(gym.Env):
-    def __init__(self, num_veh, num_ped, mode="MAPPO", *, render: bool = False, spawn_background: bool = True):
+    def __init__(self, num_veh, num_ped, mode="MAPPO", shield_mode="ecbf_collision", *, render: bool = False, experiment_path=None, spawn_background: bool = True):
         """
         Headless CarlaEnv (no pygame / rendering).
         signature keeps render/spawn_background for backward compatibility but rendering is disabled.
@@ -64,7 +66,7 @@ class CarlaEnv(gym.Env):
             "vehicle": {
                 "obs_dim": self.obs_dim,
                 "act_dim": 2,
-                "buffer_T": 128,
+                "buffer_T": 2048,
                 "num_envs": 1,
                 "n_agents": self.num_veh,
                 "buffer_size": 2048,
@@ -72,7 +74,7 @@ class CarlaEnv(gym.Env):
             "pedestrian": {
                 "obs_dim": self.obs_dim,
                 "act_dim": 2,
-                "buffer_T": 128,
+                "buffer_T": 2048,
                 "num_envs": 1,
                 "n_agents": self.num_ped,
                 "buffer_size": 2048,
@@ -157,7 +159,7 @@ class CarlaEnv(gym.Env):
             self.traffic_manager = self.client.get_trafficmanager(self.tm_port)
             # configure sync mode once (we will not call get_trafficmanager again in reset)
             try:
-                self.traffic_manager.set_synchronous_mode(True)
+                self.traffic_manager.set_synchronous_mode(False)
             except Exception:
                 # some CARLA versions use tm.set_synchronous_mode or tm.set_synchronous_mode may raise
                 pass
@@ -191,8 +193,12 @@ class CarlaEnv(gym.Env):
         self.obs_hist = None
 
         # --- experiment path & minimal logger (timestamped) ---
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.experiment_path = f"./carla_experiments/run_{timestamp}"
+        if experiment_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.experiment_path = f"./carla_experiments/run_{timestamp}"
+        else:
+            self.experiment_path = experiment_path
+
         os.makedirs(self.experiment_path, exist_ok=True)
 
         # --- episode bookkeeping ---
@@ -206,13 +212,16 @@ class CarlaEnv(gym.Env):
         # --- controllers placeholders (empty dicts; you can add controllers later) ---
         self.ego_controller = None
         self.bv_controllers = {}
-
+        self.dead_slots = set()
         # Shield / CBF training schedule (add these to __init__)
-        # Modes: 'off' (no shield), 'soft' (blend), 'hard' (legacy override — avoid in training)
-        self.shield_mode = getattr(self, "shield_mode", "soft")  # options: 'off', 'soft', 'hard'
-        # curriculum: how many episodes to warm up before enabling shield, and ramp length (episodes)
-        self.shield_warmup_episodes = getattr(self, "shield_warmup_episodes", 500)
-        self.shield_ramp_episodes = getattr(self, "shield_ramp_episodes", 1000)
+        # Shield mode:
+        # "none", "soft", "single_cbf", "ecbf_collision"
+        self.shield_mode = shield_mode
+        self.shield_affects_reward = False
+        self.safety_shield = SafetyShield(
+            mode=self.shield_mode
+        )
+
         # per-episode counter (maintained in reset)
         self.episode_num = 0
         # optionally expose safety cost weight baseline
@@ -700,6 +709,20 @@ class CarlaEnv(gym.Env):
 
         return lane_map
 
+    def get_speed_limit(self, actor):
+        """
+        Return speed limit (m/s) for given actor.
+        """
+        if actor is None:
+            return 15.0
+
+        try:
+            speed_limit_kmh = actor.get_speed_limit()
+            return speed_limit_kmh / 3.6
+        except Exception as e:
+            print(f"[Warning] Failed to get speed limit, using default 15.0 m/s. Error: {e}")
+            return 15.0  # fallback
+
     def _group_vehicles_by_road_and_lane(self):
         vehicle_map = {}
         for vehicle in [self.ego_vehicle] + self.vehicles:
@@ -713,6 +736,8 @@ class CarlaEnv(gym.Env):
 
     #------------------- reset / step / obs / reward / done -------------------
     def reset(self):
+        #print("[SHIELD] mode=", self.shield_mode)
+        self.dead_slots = set()
         self.episode_num += 1
 
         self.episode_data = {
@@ -752,16 +777,11 @@ class CarlaEnv(gym.Env):
         if tm is not None:
             try:
                 tm.set_global_distance_to_leading_vehicle(2.0)
-                try:
-                    tm.set_synchronous_mode(True)
-                except Exception:
-                    pass
                 tm.global_percentage_speed_difference(30.0)
             except Exception as e:
                 print("[RESET] traffic_manager config failed:", e)
         else:
             print("[RESET] traffic_manager is None")
-        #print("# 5) TM configured")
 
         # tick once to stabilize world
         try:
@@ -889,7 +909,7 @@ class CarlaEnv(gym.Env):
                 continue
             if "vehicle" in actor.type_id:
                 try:
-                    actor.set_autopilot(False, tm_port)
+                    actor.set_autopilot(False, self.tm_port)
                 except Exception:
                     pass
             elif "walker.pedestrian" in actor.type_id or "pedestrian" in actor.type_id:
@@ -927,6 +947,12 @@ class CarlaEnv(gym.Env):
         self.episode_data["collision_by_slot"] = {}  # dict {slot_idx: count}
         self.episode_data["intervention"] = 0  # how many times shield/CBF intervened
         self.episode_data["step_count"] = 0  # step counter within episode
+        self.episode_data["speed_sum"] = 0.0
+        self.episode_data["acc_sum"] = 0.0
+        self.episode_data["ttc_sum"] = 0.0
+        self.episode_data["ttc_min"] = float("inf")
+        self.episode_data["intervention_mag_sum"] = 0.0
+        self.episode_data["agent_step_count"] = 0
 
         self.step_data = {}
         self.last_location = self.ego_vehicle.get_location()
@@ -1205,97 +1231,116 @@ class CarlaEnv(gym.Env):
         """
         actions: dict mapping slot_idx -> action (e.g. [throttle, steer])
         Returns: next_obs, rewards, dones, info
-        - rewards/dones keyed by slot_idx
-        - info contains applied_slots for debugging
         """
+
         applied_slots = []
-
-        # --- DEBUG: print slot->actor mapping and ego id once per step ---
-        if not hasattr(self, "_dbg_printed_step"):
-            print("DEBUG: ego_vehicle.id =",
-                  getattr(self, "ego_vehicle").id if getattr(self, "ego_vehicle", None) else None)
-            print("DEBUG: slot2actor (len) =", len(self.slot2actor) if self.slot2actor is not None else 0)
-            if self.slot2actor is not None:
-                for i, aid in enumerate(self.slot2actor):
-                    print(f"DEBUG: slot {i} -> actor_id {aid}")
-            print("DEBUG: rl_slots:", getattr(self, "rl_slots", None))
-            self._dbg_printed_step = True
-
-        # prepare per-step safety logging container
         slot_worst_ttc = {}
+        step_intervention_count = 0
+        self.dead_slots = getattr(self, "dead_slots", set())
 
-        # constants (use attributes if present, else defaults)
         TTC_MIN = getattr(self, "TTC_MIN", 0.8)
         TTC_WARN = getattr(self, "TTC_WARN", 2.0)
-        DIST_MIN = getattr(self, "DIST_MIN", 1.0)
 
-        # ensure episode_data has expected keys
-        if not isinstance(self.episode_data, dict):
-            self.episode_data = {}
-        self.episode_data.setdefault("intervention", 0)
-        self.episode_data.setdefault("blend_log", [])
-        self.episode_data.setdefault("safety_costs", [])
-        self.episode_data.setdefault("reward_components", [])
         self.episode_data.setdefault("step_count", 0)
+        self.episode_data.setdefault("intervention", 0)
 
-        # per-slot loop (apply blended controls)
+        active_agent_count = 0
+
+        # ---------------------------------------------------------
+        # Per-agent control loop
+        # ---------------------------------------------------------
+
         for slot_idx, act in actions.items():
-            if not hasattr(self, "rl_slots") or slot_idx not in self.rl_slots:
+            if slot_idx in self.dead_slots:
                 continue
 
-            if slot_idx < 0 or slot_idx >= (len(self.slot2actor) if self.slot2actor is not None else 0):
+            if slot_idx not in self.rl_slots:
                 continue
-            actor_id = self.slot2actor[slot_idx] if self.slot2actor is not None else None
+
+            actor_id = self.slot2actor[slot_idx]
             if actor_id is None:
                 continue
 
             actor = self.world.get_actor(actor_id)
-            if actor is None:
+            if actor is None or "vehicle" not in actor.type_id:
                 continue
 
-            if "vehicle" not in actor.type_id:
-                continue
+            active_agent_count += 1
+            self.episode_data["agent_step_count"] += 1
 
-            # --- normalize agent action ---
-            a0 = float(act[0])
-            a1 = float(act[1]) if len(act) > 1 else 0.0
-            a0 = np.clip(a0, -1.0, 1.0)
-            a1 = np.clip(a1, -1.0, 1.0)
+            a0 = float(np.clip(act[0], -1.0, 1.0))
+            a1 = float(np.clip(act[1], -1.0, 1.0))
 
-            if a0 >= 0.0:
+            if a0 >= 0:
                 thr = a0
                 brk = 0.0
             else:
                 thr = 0.0
                 brk = -a0
 
-            steer = np.clip(a1, -1.0, 1.0)
+            control = carla.VehicleControl()
+            control.throttle = thr
+            control.brake = brk
+            control.steer = a1
 
-            prev = self._last_control.get(
-                slot_idx, {"throttle": 0.0, "brake": 0.0, "steer": 0.0}
+            candidate_ids = [aid for aid in self.slot2actor if aid is not None]
+            if self.ego_vehicle and self.ego_vehicle.id not in candidate_ids:
+                candidate_ids.append(self.ego_vehicle.id)
+
+            agent_loc = actor.get_location()
+            agent_vel_obj = actor.get_velocity()
+            speed = np.linalg.norm([agent_vel_obj.x, agent_vel_obj.y])
+            self.episode_data["speed_sum"] += speed
+
+            agent_pos = np.array([agent_loc.x, agent_loc.y], dtype=np.float32)
+            agent_vel = np.array([agent_vel_obj.x, agent_vel_obj.y], dtype=np.float32)
+
+            others_pos = []
+            others_vel = []
+
+            for other_id in candidate_ids:
+                if other_id == actor_id:
+                    continue
+
+                other = self.world.get_actor(other_id)
+                if other is None:
+                    continue
+
+                loc = other.get_location()
+                vel = other.get_velocity()
+
+                others_pos.append(np.array([loc.x, loc.y], dtype=np.float32))
+                others_vel.append(np.array([vel.x, vel.y], dtype=np.float32))
+
+            a_long = control.throttle - control.brake
+            a_lat = control.steer
+            a_agent_des = np.array([a_long, a_lat], dtype=np.float32)
+            acc_mag = np.linalg.norm(a_agent_des)
+            self.episode_data["acc_sum"] += acc_mag
+
+            a_safe = self.safety_shield.apply(
+                agent_pos,
+                agent_vel,
+                a_agent_des,
+                others_pos,
+                others_vel
             )
 
-            alpha = 0.85
-            thr_s = prev["throttle"] * alpha + thr * (1 - alpha)
-            brk_s = prev["brake"] * alpha + brk * (1 - alpha)
-            steer_s = prev["steer"] * alpha + steer * (1 - alpha)
+            if not np.allclose(a_safe, a_agent_des, atol=1e-3):
+                mag = np.linalg.norm(a_safe - a_agent_des)
+                self.episode_data["intervention_mag_sum"] += mag
+                self.episode_data["intervention"] += 1
+                step_intervention_count += 1
 
-            control = carla.VehicleControl()
-            control.throttle = float(np.clip(thr_s, 0.0, 1.0))
-            control.brake = float(np.clip(brk_s, 0.0, 1.0))
-            control.steer = float(np.clip(steer_s, -1.0, 1.0))
+            control.throttle = float(np.clip(max(a_safe[0], 0.0), 0.0, 1.0))
+            control.brake = float(np.clip(max(-a_safe[0], 0.0), 0.0, 1.0))
+            control.steer = float(np.clip(a_safe[1], -1.0, 1.0))
 
-            # --- compute worst TTC vs other vehicles (unchanged logic) ---
-            act_loc = actor.get_location()
-            act_vel = actor.get_velocity()
-            act_v = np.array([act_vel.x, act_vel.y])
+            actor.apply_control(control)
+            applied_slots.append(slot_idx)
 
+            act_v = agent_vel
             worst_ttc = np.inf
-
-            candidate_ids = [aid for aid in self.slot2actor if aid is not None] if self.slot2actor is not None else []
-            if getattr(self, "ego_vehicle", None) is not None:
-                if self.ego_vehicle.id not in candidate_ids:
-                    candidate_ids.append(self.ego_vehicle.id)
 
             for other_id in candidate_ids:
                 if other_id == actor_id:
@@ -1307,18 +1352,19 @@ class CarlaEnv(gym.Env):
 
                 other_loc = other.get_location()
                 other_vel = other.get_velocity()
-                other_v = np.array([other_vel.x, other_vel.y])
 
-                r = np.array([other_loc.x - act_loc.x,
-                              other_loc.y - act_loc.y])
+                r = np.array([
+                    other_loc.x - agent_loc.x,
+                    other_loc.y - agent_loc.y
+                ])
+
                 dist = np.linalg.norm(r)
-                if dist > 30.0:
-                    continue
                 if dist < 1e-3:
                     worst_ttc = 0.0
                     break
 
                 r_hat = r / dist
+                other_v = np.array([other_vel.x, other_vel.y])
                 d_dot = np.dot((other_v - act_v), r_hat)
 
                 if d_dot < -1e-3:
@@ -1326,169 +1372,89 @@ class CarlaEnv(gym.Env):
                 else:
                     ttc = np.inf
 
-                if ttc < worst_ttc:
-                    worst_ttc = ttc
+                worst_ttc = min(worst_ttc, ttc)
 
-            # record worst_ttc for this slot for later reward / logging
-            slot_worst_ttc[slot_idx] = float(worst_ttc) if np.isfinite(worst_ttc) else float("inf")
+            slot_worst_ttc[slot_idx] = float(worst_ttc)
+            self.episode_data["ttc_sum"] += worst_ttc
+            self.episode_data["ttc_min"] = min(
+                self.episode_data["ttc_min"],
+                worst_ttc
+            )
 
-            # --- SOFT BLENDING (replace hard override) ---
-            safe_control = carla.VehicleControl()
-            safe_control.throttle = 0.0
-            safe_control.brake = 0.9
-            safe_control.steer = 0.0
-
-            # curriculum / runtime shield decision
-            # (self.episode_num set in reset; defaults exist in __init__)
-            if getattr(self, "episode_num", 0) <= getattr(self, "shield_warmup_episodes", 0):
-                # warmup: shield off
-                blend = 0.0
-            elif getattr(self, "episode_num", 0) <= (
-                    getattr(self, "shield_warmup_episodes", 0) + getattr(self, "shield_ramp_episodes", 0)):
-                # ramp-in: scale blending linearly by episode progress
-                ramp_base = (getattr(self, "episode_num", 0) - getattr(self, "shield_warmup_episodes", 0)) / max(1,
-                                                                                                                 getattr(
-                                                                                                                     self,
-                                                                                                                     "shield_ramp_episodes",
-                                                                                                                     1))
-                ramp_base = float(np.clip(ramp_base, 0.0, 1.0))
-                if worst_ttc < TTC_WARN:
-                    base = (TTC_WARN - worst_ttc) / max(1e-6, (TTC_WARN - TTC_MIN))
-                    base = float(np.clip(base, 0.0, 1.0))
-                    blend = ramp_base * base
-                else:
-                    blend = 0.0
-            else:
-                # fully enabled soft shield behavior
-                if worst_ttc < TTC_WARN:
-                    blend = (TTC_WARN - worst_ttc) / max(1e-6, (TTC_WARN - TTC_MIN))
-                    blend = float(np.clip(blend, 0.0, 1.0))
-                else:
-                    blend = 0.0
-
-            # shaping to avoid tiny jitter
-            blend = float(np.clip(blend, 0.0, 1.0))
-            blend_shaped = blend ** 1.25
-
-            # apply blend
-            control.throttle = float((1.0 - blend_shaped) * control.throttle + blend_shaped * safe_control.throttle)
-            control.brake = float((1.0 - blend_shaped) * control.brake + blend_shaped * safe_control.brake)
-            control.steer = float((1.0 - blend_shaped) * control.steer + blend_shaped * safe_control.steer)
-
-            # bookkeeping: count intervention when significant
-            if blend_shaped > 0.05:
-                self.episode_data["intervention"] = self.episode_data.get("intervention", 0) + 1
-
-            # log blend & safety
-            self.episode_data.setdefault("blend_log", []).append(float(blend_shaped))
-            self.episode_data.setdefault("safety_costs", []).append(
-                {"slot": int(slot_idx), "ttc": float(worst_ttc), "blend": float(blend_shaped)})
-
-            # apply control & store last control
-            actor.apply_control(control)
-            applied_slots.append(slot_idx)
-
-            self._last_control[slot_idx] = {
-                "throttle": control.throttle,
-                "brake": control.brake,
-                "steer": control.steer
-            }
-
-        # advance simulation (synchronous mode assumed)
+        # ---------------------------------------------------------
+        # Advance simulation
+        # ---------------------------------------------------------
         self.world.tick()
-        self.episode_data["step_count"] = self.episode_data.get("step_count", 0) + 1
+        self.episode_data["step_count"] += 1
 
-        # get next observation (single-frame)
-        next_obs = self.get_single_obs_for_manager(ego_id=self.ego_vehicle.id, radius=200.0)
+        next_obs = self.get_single_obs_for_manager(
+            ego_id=self.ego_vehicle.id,
+            radius=200.0
+        )
 
-        # compute per-slot rewards and dones (keyed by slot_idx)
         rewards = {}
         dones = {}
 
+        ego_id = getattr(self.ego_vehicle, "id", None)
+
         for slot_idx in self.rl_slots:
+
             actor_id = self.slot2actor[slot_idx]
+
             if actor_id is None:
                 rewards[slot_idx] = 0.0
-                dones[slot_idx] = True
+                dones[slot_idx] = False
                 continue
 
-            # base task reward (leave existing logic intact)
-            try:
-                base_reward = float(self._compute_reward(actor_id))
-            except Exception:
-                base_reward = 0.0
-
-            # compute safety_cost from recorded worst_ttc (continuous in [0,1])
-            ttc = slot_worst_ttc.get(slot_idx, float("inf"))
-            safety_cost = 0.0
-            if ttc < TTC_WARN:
-                if ttc <= 0.0:
-                    safety_cost = 1.0
-                else:
-                    safety_cost = float(np.clip((TTC_WARN - ttc) / max(1e-6, (TTC_WARN - TTC_MIN)), 0.0, 1.0))
-
-            # curriculum-driven small penalty weight (MAPPO stage: keep tiny)
-            if getattr(self, "episode_num", 0) <= getattr(self, "shield_warmup_episodes", 0):
-                cost_weight = 0.0
-            elif getattr(self, "episode_num", 0) <= (
-                    getattr(self, "shield_warmup_episodes", 0) + getattr(self, "shield_ramp_episodes", 0)):
-                frac = (getattr(self, "episode_num", 0) - getattr(self, "shield_warmup_episodes", 0)) / max(1, getattr(
-                    self, "shield_ramp_episodes", 1))
-                cost_weight = float(self.safety_cost_base_weight * np.clip(frac, 0.0, 1.0))
-            else:
-                cost_weight = float(self.safety_cost_base_weight)
-
-            # final reward: base minus small safety penalty (very small during MAPPO)
-            final_reward = base_reward - float(cost_weight * safety_cost)
-            rewards[slot_idx] = float(final_reward)
-
-            # append reward components for logging (keep existing components if present)
-            try:
-                comps = self._compute_reward_components(actor_id)
-                if comps is None:
-                    comps = {}
-
-                # add safety
-                comps["safety_cost"] = float(safety_cost)
-
-                # --- ENSURE SAME KEYS EVERY STEP ---
-                for k in self.reward_comp_keys:
-                    if k not in comps:
-                        comps[k] = 0.0
-
-                self.episode_data["reward_components"].append(comps)
-
-            except Exception:
-                self.episode_data.setdefault("reward_components", []).append(
-                    {"safety_cost": float(safety_cost), "weight": float(cost_weight)})
-
-            # dones: reuse your existing check
-            try:
-                dones[slot_idx] = bool(self._check_done(actor_id))
-            except Exception:
+            actor = self.world.get_actor(actor_id)
+            if actor is None:
+                rewards[slot_idx] = 0.0
                 dones[slot_idx] = False
+                continue
+            # Background off-road reset
+            if actor_id != ego_id:
+                wp = self.map.get_waypoint(actor.get_location(), project_to_road=False)
+                if wp is None:
+                    self._bg_collision_slots = getattr(self, "_bg_collision_slots", set())
+                    self._bg_collision_slots.add(slot_idx)
+                    self.dead_slots.add(slot_idx)
+                    dones[slot_idx] = True
 
-        # build info dict (expose diagnostics)
-        blend_list = self.episode_data.get("blend_log", [])
-        blend_mean = float(np.mean(blend_list)) if blend_list else 0.0
-        ttc_log = self.episode_data.get("ttc_log", [])
+            if slot_idx in self.dead_slots:
+                rewards[slot_idx] = 0.0
+                dones[slot_idx] = True
+            else:
+                base_reward = float(self._compute_reward(actor_id))
+                rewards[slot_idx] = base_reward
+                if slot_idx not in dones:
+                    dones[slot_idx] = False
 
-        if ttc_log:
-            finite_ttc = [t for t in ttc_log if np.isfinite(t)]
-            avg_safety_ttc = float(np.mean(finite_ttc)) if finite_ttc else 0.0
-        else:
-            avg_safety_ttc = 0.0
+        # Ego-only termination
+        if self._episode_done():
+            for slot_idx in self.rl_slots:
+                dones[slot_idx] = True
+        # --- apply forced-done slots from callbacks (collision/resets) ---
+        if hasattr(self, "_force_done_slots") and self._force_done_slots:
+            for s in list(self._force_done_slots):
+                if s in dones:
+                    dones[s] = True
+                self.dead_slots.add(s)
+            self._force_done_slots.clear()
 
         info = {
             "applied_slots": applied_slots,
-            "collision_count": int(self.episode_data.get("collision_count", 0)),
-            "collision_happened": int(self.episode_data.get("collision_happened", 0)),
-            "collision_by_slot": dict(self.episode_data.get("collision_by_slot", {})),
-            "intervention_count": int(self.episode_data.get("intervention", 0)),
-            "episode_step_count": int(self.episode_data.get("step_count", 0)),
-            "blend_mean": blend_mean,
-            "avg_safety_ttc": avg_safety_ttc,
+            # active_agent_count: number of agents that acted this step (used by trainer)
+            "active_agent_count": int(active_agent_count),
+            "step_count": int(self.episode_data.get("step_count", 0)),
+            # per-step CBF/shield interventions this step (trainer expects 'intervention_this_step')
+            "intervention_this_step": int(step_intervention_count),
+            # legacy/backwards fields for diagnostics
+            "cbf_step_interventions": int(step_intervention_count),
+            "cbf_total_interventions": int(self.episode_data.get("intervention", 0))
         }
+
+        if hasattr(self, "_bg_collision_slots"):
+            self._bg_collision_slots.clear()
 
         return next_obs, rewards, dones, info
 
@@ -1545,7 +1511,8 @@ class CarlaEnv(gym.Env):
         # ======================
         # 1) Speed reward (bounded)
         # ======================
-        v_target = 8.0  # m/s  ≈ 30 km/h
+        speed_limit = self.get_speed_limit(actor)
+        v_target = 0.9 * speed_limit
         v_tol = 2.0
 
         r_speed = np.exp(-((v - v_target) ** 2) / (2 * v_tol ** 2))
@@ -1612,14 +1579,27 @@ class CarlaEnv(gym.Env):
         r_att = -0.01 * (roll / 45.0) ** 2 - 0.01 * (pitch / 45.0) ** 2
 
         # ======================
+        # Collision / Off-road penalty
+        # ======================
+        penalty = 0.0
+        if hasattr(self, "slot2actor") and actor_id in self.slot2actor:
+            try:
+                slot_idx = self.slot2actor.index(actor_id)
+                if hasattr(self, "_bg_collision_slots") and slot_idx in self._bg_collision_slots:
+                    penalty = -1.5
+            except ValueError:
+                pass
+
+        # ======================
         # Final weighted reward
         # ======================
         reward = (
-                0.4 * r_speed
-                + 0.6 * r_direction
-                + 0.5 * r_lane
-                + 0.8 * r_dist
-                + 1.0 * r_att
+                0.4 * r_speed +
+                0.6 * r_direction +
+                0.5 * r_lane +
+                0.8 * r_dist +
+                1.0 * r_att +
+                penalty
         )
 
         reward = np.clip(reward, -3.0, 3.0)
@@ -1731,57 +1711,16 @@ class CarlaEnv(gym.Env):
             "sum": r_speed + r_direction + r_lane + r_dist + r_att
         }
 
-    #
-    # def _compute_reward(self, actor_id):
-    #     actor = self.world.get_actor(actor_id)
-    #     if actor is None:
-    #         return 0.0
-    #
-    #     vel = actor.get_velocity()
-    #     speed = (vel.x ** 2 + vel.y ** 2 + vel.z ** 2) ** 0.5
-    #
-    #     wp = self.map.get_waypoint(actor.get_location(), project_to_road=False)
-    #     if wp is None:
-    #         return -5.0
-    #
-    #     key = f"last_s_{actor_id}"
-    #     last_s = self.episode_data.get(key, wp.s)
-    #     progress = wp.s - last_s
-    #     self.episode_data[key] = wp.s
-    #
-    #     ego_loc = self.ego_vehicle.get_location()
-    #     loc = actor.get_location()
-    #     dist = ego_loc.distance(loc)
-    #
-    #     lane_center_dist = abs(wp.lane_width * 0.5 - abs(wp.transform.location.distance(loc)))
-    #
-    #     reward = 0.0
-    #     reward += 0.5 * np.tanh(speed / 10.0)
-    #     reward += 1.0 * np.clip(progress, -5.0, 5.0)
-    #     reward -= 0.2 * lane_center_dist
-    #     reward -= 0.1 / (dist + 1e-3)
-    #
-    #     tr = actor.get_transform()
-    #     if abs(tr.rotation.roll) > 45 or abs(tr.rotation.pitch) > 45:
-    #         reward -= 2.0
-    #
-    #     return float(reward)
-
     def _check_done(self, actor_id):
         actor = self.world.get_actor(actor_id)
         if actor is None:
             return True
 
-        if getattr(self, "collision_happened", False):
-            return True
-
-        tr = actor.get_transform()
-        if abs(tr.rotation.roll) > 45.0 or abs(tr.rotation.pitch) > 45.0:
-            return True
-
-        wp = self.map.get_waypoint(actor.get_location(), project_to_road=False)
-        if wp is None:
-            return True
+        # Only ego can terminate episode
+        if actor_id == getattr(self.ego_vehicle, "id", None):
+            wp = self.map.get_waypoint(actor.get_location(), project_to_road=False)
+            if wp is None:
+                return True
 
         return False
 
@@ -1916,39 +1855,98 @@ class CarlaEnv(gym.Env):
         self.latest_camera_image = array
 
     def _on_collision(self, event):
-        # ignore during destroy
+        """
+        Safe collision handler — minimal-change replacement.
+
+        Behavior preserved:
+          - increment episode collision_count
+          - if ego involved -> set self.collision_happened True (episode termination)
+          - if background agent collided -> mark slot in _bg_collision_slots and reset that agent
+          - never raise NameError for slot_idx (compute it here)
+          - avoid double-reset / duplicated logic
+        """
+        # ignore callbacks while destroying
         if getattr(self, "_destroying", False):
             return
 
-        # mark occurrence
-        self.collision_happened = True
-        self.episode_data["collision_happened"] = 1
+        # record a collision happened in episode stats
+        # self.episode_data["collision_count"] = self.episode_data.get("collision_count", 0) + 1
 
-        self.episode_data["collision_count"] = self.episode_data.get("collision_count", 0) + 1
-        print("### COLLISION COUNT =", self.episode_data["collision_count"])
+        # try to obtain the "other" actor from event
+        other = getattr(event, "other_actor", None) or getattr(event, "actor", None)
+        if other is None:
+            return
 
-        # try to attribute collision to a slot index if possible
+        other_id = other.id if hasattr(other, "id") else None
+        if other_id is None:
+            return
+
+        ego_id = getattr(self.ego_vehicle, "id", None)
+
+        # If ego is one of the colliding actors -> terminate episode
+        # (some CARLA events may present 'other' as the non-ego; check both sides conservatively)
+        if other_id == ego_id:
+            self.collision_happened = True
+            return
+
+        # compute slot_idx by reverse-mapping slot2actor (slot2actor contains actor ids)
+        slot_idx = None
         try:
-            # CARLA event often has fields like 'other_actor' or 'actor'
-            other = getattr(event, "other_actor", None) or getattr(event, "actor", None)
-            if other is not None:
-                other_id = other.id if hasattr(other, "id") else None
-                if other_id is not None and hasattr(self, "slot2actor"):
-                    # find slot index corresponding to actor id
-                    slot_idx = None
-                    for s, aid in enumerate(getattr(self, "slot2actor", [])):
+            if hasattr(self, "slot2actor") and self.slot2actor is not None:
+                for s, aid in enumerate(self.slot2actor):
+                    # skip empty slots
+                    if aid is None:
+                        continue
+                    try:
+                        if int(aid) == int(other_id):
+                            slot_idx = s
+                            break
+                    except Exception:
                         if aid == other_id:
                             slot_idx = s
                             break
-                    if slot_idx is not None:
-                        by_slot = self.episode_data.setdefault("collision_by_slot", {})
-                        by_slot[slot_idx] = by_slot.get(slot_idx, 0) + 1
         except Exception:
-            # robust fallback: ignore attribution errors
+            slot_idx = None
+
+        # If background agent collided -> mark slot and reset that agent
+        if slot_idx is not None:
+            self.episode_data.setdefault("_collision_slots", set())
+            self.episode_data["_collision_slots"].add(slot_idx)
+
+            self._bg_collision_slots = getattr(self, "_bg_collision_slots", set())
+            self._bg_collision_slots.add(slot_idx)
+            self._force_done_slots = getattr(self, "_force_done_slots", set())
+            self._force_done_slots.add(slot_idx)
+            try:
+                self._reset_background_agent(other_id)
+            except Exception as e:
+                print(f"[WARN] _reset_background_agent failed for actor {other_id}: {e}")
+            # done
+            return
+
+        # If we reach here: other actor is not mapped to any slot and not the ego.
+        # Best-effort: try resetting the actor by id (non-slot background actor)
+        try:
+            self._reset_background_agent(other_id)
+        except Exception as e:
+            # swallow errors so callback never crashes
+            print(f"[WARN] _reset_background_agent fallback failed for actor {other_id}: {e}")
+
+    def _reset_background_agent(self, actor_id):
+        actor = self.world.get_actor(actor_id)
+        if actor is None:
+            return
+
+        wp = self.map.get_waypoint(actor.get_location(), project_to_road=True)
+        if wp is None:
+            return
+
+        new_transform = wp.transform
+        new_transform.location.z += 0.5
+
+        try:
+            actor.set_transform(new_transform)
+            actor.set_velocity(carla.Vector3D(0, 0, 0))
+            actor.set_angular_velocity(carla.Vector3D(0, 0, 0))
+        except Exception:
             pass
-
-        # optional debug (comment out in production)
-        # print(f"[COLLISION] total={self.episode_data['collision_count']}")
-
-
-

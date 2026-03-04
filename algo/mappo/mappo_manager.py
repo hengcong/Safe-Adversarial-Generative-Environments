@@ -27,9 +27,9 @@ class MAPPOManager(object):
         agent_specs: either numeric-keyed dict {slot: spec} or type-keyed {"vehicle": spec_with n_agents, ...}
         policy_ctor: callable(spec) -> policy instance
         """
-        import copy
         self.device = torch.device(device)
         self.selector = selector
+
 
         specs = dict(agent_specs or {})
         numeric_keys = all(isinstance(k, int) for k in specs.keys()) if specs else False
@@ -294,14 +294,15 @@ class MAPPOManager(object):
             bev_hidden=bev_hidden_np
         )
 
-    def update_all(self,
-                   ppo_epochs=2,
-                   clip_coef=0.2,
-                   value_coef=0.1,
-                   entropy_coef=0.01,
-                   max_grad_norm=0.5,
-                   num_mini_batches=4):
-
+    def update_all(
+            self,
+            ppo_epochs=2,
+            clip_coef=0.2,
+            value_coef=0.1,
+            entropy_coef=0.02,
+            max_grad_norm=0.5,
+            num_mini_batches=4,
+    ):
         if self.buffer is None:
             return {}
 
@@ -321,7 +322,10 @@ class MAPPOManager(object):
         num_updates = 0
 
         for _ in range(ppo_epochs):
-            for batch in self.buffer.feed_forward_generator(num_mini_batches=num_mini_batches):
+
+            for batch in self.buffer.feed_forward_generator(
+                    num_mini_batches=num_mini_batches
+            ):
 
                 images = batch.get("images", None)
                 agent_feats = batch["agent_feats"]
@@ -330,21 +334,19 @@ class MAPPOManager(object):
                 old_logp = batch["logp"]
                 returns = batch["returns"]
                 advantages = batch["advantages"].to(device)
+
                 with torch.no_grad():
-                    # Use masks to only normalize valid transitions if necessary,
-                    # but standard batch normalization is usually sufficient:
                     adv_mean = advantages.mean()
                     adv_std = advantages.std()
                     advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
                 masks = batch["masks"]
-
                 init_slot = batch.get("init_slot_hidden", None)
                 init_bev = batch.get("init_bev_hidden", None)
 
-                # move to device
                 if images is not None:
                     images = images.to(device)
+
                 agent_feats = agent_feats.to(device)
                 type_id = type_id.to(device)
                 actions = actions.to(device)
@@ -352,42 +354,57 @@ class MAPPOManager(object):
                 returns = returns.to(device)
                 advantages = advantages.to(device)
                 masks = masks.to(device)
+
                 if init_slot is not None:
                     init_slot = init_slot.to(device)
                 if init_bev is not None:
                     init_bev = init_bev.to(device)
+
                 # --- safe handling of optional pre_t from buffer ---
                 pre_t_batch = batch.get("pre_t", None)
+
                 if pre_t_batch is not None:
-                    # ensure it's a tensor on device/dtype
-                    pre_t_batch = torch.as_tensor(pre_t_batch, device=device, dtype=torch.float32)
+                    pre_t_batch = torch.as_tensor(
+                        pre_t_batch,
+                        device=device,
+                        dtype=torch.float32,
+                    )
                 else:
                     pre_t_batch = None
 
-                # action_scale from policy (make tensor on device)
                 action_scale = getattr(self.policy, "action_scale", 1.0)
-                if not torch.is_tensor(action_scale):
-                    action_scale_t = torch.as_tensor(action_scale, device=device, dtype=torch.float32)
-                else:
-                    action_scale_t = action_scale.to(device=device, dtype=torch.float32)
 
-                # If buffer unexpectedly stored pre_t instead of executed (scaled) actions,
-                # try to reconstruct actions from pre_t when actions look like "empty/unscaled".
-                # Heuristic: if actions max abs is small (< 1e-6) OR all values within [-1,1] but policy scale >1,
-                # then prefer reconstructed actions. This is conservative and won't clobber proper actions.
+                if not torch.is_tensor(action_scale):
+                    action_scale_t = torch.as_tensor(
+                        action_scale,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                else:
+                    action_scale_t = action_scale.to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
+
                 try:
-                    # ensure actions is tensor on device (already moved above)
                     if pre_t_batch is not None:
-                        # compute candidate actions from pre_t
-                        cand_actions = torch.tanh(pre_t_batch) * action_scale_t.view(1, 1, 1,
-                                                                                     -1) if pre_t_batch.dim() == 4 else torch.tanh(
-                            pre_t_batch) * action_scale_t
-                        # conservative replacement condition:
-                        # replace if actions looks like placeholder (near zero) OR if cand_actions max > actions max by a factor
+
+                        if pre_t_batch.dim() == 4:
+                            cand_actions = (
+                                    torch.tanh(pre_t_batch)
+                                    * action_scale_t.view(1, 1, 1, -1)
+                            )
+                        else:
+                            cand_actions = (
+                                    torch.tanh(pre_t_batch)
+                                    * action_scale_t
+                            )
+
                         try:
                             act_max = float(actions.abs().max().item())
                         except Exception:
                             act_max = 0.0
+
                         try:
                             cand_max = float(cand_actions.abs().max().item())
                         except Exception:
@@ -395,133 +412,171 @@ class MAPPOManager(object):
 
                         if act_max < 1e-6 and cand_max > 1e-6:
                             actions = cand_actions
-                            print("[WARN] Reconstructed actions from pre_t_batch (buffer likely stored pre_t).")
-                        # else do not overwrite actions; assume buffer stored scaled actions already
+                            print(
+                                "[WARN] Reconstructed actions from pre_t_batch (buffer likely stored pre_t)."
+                            )
+
                 except Exception as e:
                     print("[WARN] pre_t handling failed:", e)
 
-                # --- Always compute new_logp/values/entropy via evaluate_actions (do not depend on pre_t presence) ---
-                # prepare obs dict (already moved to device above)
-                obs_eval = {
-                    "image": images,
-                    "agent_feats": agent_feats,
-                    "type_id": type_id
-                }
-
-                # sanity: ensure actions are on device and float
-                actions = actions.to(device=device, dtype=torch.float32)
-
-                # ensure masks dtype/device
-                masks = masks.to(device=device, dtype=torch.float32)
                 eval_out = self.policy.evaluate_actions(
                     obs={
                         "image": images,
                         "agent_feats": agent_feats,
-                        "type_id": type_id
+                        "type_id": type_id,
                     },
                     actions=actions,
                     mask=masks,
                     slot_hidden=init_slot,
                     bev_hidden=init_bev,
                     mode="seq",
-                    pre_t=pre_t_batch
+                    pre_t=pre_t_batch,
                 )
 
                 new_logp = eval_out["log_probs"]
                 values = eval_out["values"]
                 entropy = eval_out["entropy"]
 
-                # safety: shapes should match; if not, try common permute (but also log warning)
                 if new_logp.shape != old_logp.shape:
                     try:
-                        if new_logp.dim() == 3 and old_logp.dim() == 3 and new_logp.numel() == old_logp.numel():
+                        if (
+                                new_logp.dim() == 3
+                                and old_logp.dim() == 3
+                                and new_logp.numel() == old_logp.numel()
+                        ):
                             new_logp = new_logp.permute(1, 0, 2).contiguous()
-                            print("[WARN] permuted new_logp to match old_logp shapes")
+                            print(
+                                "[WARN] permuted new_logp to match old_logp shapes"
+                            )
                         else:
-                            print(f"[WARN] shape mismatch new_logp {tuple(new_logp.shape)} vs old_logp {tuple(old_logp.shape)}")
+                            print(
+                                f"[WARN] shape mismatch new_logp {tuple(new_logp.shape)} vs old_logp {tuple(old_logp.shape)}"
+                            )
                     except Exception as e:
                         print("Shape align permute failed:", e)
 
                 diff = new_logp - old_logp
                 denom = masks.sum() + 1e-8
 
-                # ===== diagnostics (single place, guarded) =====
+                # ===== diagnostics =====
                 with torch.no_grad():
+
                     old_lp = old_logp.to(new_logp.device)
                     new_lp = new_logp
-                    print("DIAG SHAPES: old_logp", tuple(old_lp.shape), "new_logp", tuple(new_lp.shape))
-                    print("DIAG STATS: old mean,std",
-                          float(old_lp.mean().item()), float(old_lp.std().item()),
-                          "new mean,std", float(new_lp.mean().item()), float(new_lp.std().item()))
-                    d = (new_lp - old_lp)
-                    print("DIFF mean,std,abs_mean,max:",
-                          float(d.mean().item()), float(d.std().item()), float(d.abs().mean().item()), float(d.abs().max().item()))
+
+                    print(
+                        "DIAG SHAPES:",
+                        tuple(old_lp.shape),
+                        tuple(new_lp.shape),
+                    )
+
+                    print(
+                        "DIAG STATS:",
+                        float(old_lp.mean().item()),
+                        float(old_lp.std().item()),
+                        float(new_lp.mean().item()),
+                        float(new_lp.std().item()),
+                    )
+
+                    d = new_lp - old_lp
+
+                    print(
+                        "DIFF mean,std,abs_mean,max:",
+                        float(d.mean().item()),
+                        float(d.std().item()),
+                        float(d.abs().mean().item()),
+                        float(d.abs().max().item()),
+                    )
+
                     thr = 3.0
-                    frac_big = (d.abs() > thr).float().mean().item() * 100.0
+                    frac_big = (
+                            (d.abs() > thr).float().mean().item() * 100.0
+                    )
                     print(f"FRAC abs(diff)>{thr}: {frac_big:.2f}%")
-                    try:
-                        old_flat = old_lp.flatten(); new_flat = new_lp.flatten()
-                        if old_flat.numel() > 10:
-                            vx = old_flat - old_flat.mean(); vy = new_flat - new_flat.mean()
-                            corr = (vx * vy).sum() / (torch.sqrt((vx * vx).sum() * (vy * vy).sum()) + 1e-8)
-                            print("Pearson corr old_vs_new:", float(corr.item()))
-                    except Exception as e:
-                        print("Pearson corr failed:", e)
-
-                    # safe print of a few per-sample diffs
-                    try:
-                        flat_d = d.flatten()
-                        nshow = min(10, flat_d.numel())
-                        vals, idxs = flat_d.abs().topk(nshow, largest=True)
-                        print("Top diffs (abs) idx,val:", [(int(i.item()), float(v.item())) for i, v in zip(idxs, vals)])
-                        print("First 10 diffs:", [float(x.item()) for x in flat_d[:nshow]])
-                    except Exception:
-                        pass
-                # ===== end diagnostics =====
-
 
                 ratio = torch.exp(diff)
-                # DEBUG: per-batch diagnostics (only print first few updates)
+
                 if num_updates < 2:
                     with torch.no_grad():
                         print("===== DIAG BATCH =====")
-                        print("advantages mean,std:", float(advantages.mean().item()), float(advantages.std().item()))
-                        print("returns mean,std:", float(returns.mean().item()), float(returns.std().item()))
-                        print("values mean,std:", float(values.mean().item()), float(values.std().item()))
-                        try:
-                            print("actions mean,std:", float(actions.mean().item()), float(actions.std().item()))
-                        except Exception:
-                            pass
-                        print("old_logp mean,std:", float(old_logp.mean().item()), float(old_logp.std().item()))
-                        if pre_t_batch is not None:
-                            try:
-                                print("pre_t mean,std:", float(pre_t_batch.mean().item()),
-                                      float(pre_t_batch.std().item()))
-                            except Exception:
-                                pass
-                        else:
-                            print("pre_t: None")
+                        print(
+                            "advantages mean,std:",
+                            float(advantages.mean().item()),
+                            float(advantages.std().item()),
+                        )
+                        print(
+                            "returns mean,std:",
+                            float(returns.mean().item()),
+                            float(returns.std().item()),
+                        )
+                        print(
+                            "values mean,std:",
+                            float(values.mean().item()),
+                            float(values.std().item()),
+                        )
+                        print(
+                            "actions mean,std:",
+                            float(actions.mean().item()),
+                            float(actions.std().item()),
+                        )
+                        print(
+                            "old_logp mean,std:",
+                            float(old_logp.mean().item()),
+                            float(old_logp.std().item()),
+                        )
 
                 surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * advantages
+                surr2 = torch.clamp(
+                    ratio,
+                    1.0 - clip_coef,
+                    1.0 + clip_coef,
+                ) * advantages
 
-                policy_loss = -((torch.min(surr1, surr2)) * masks).sum() / denom
-                value_loss = (((returns - values) ** 2) * masks).sum() / denom
+                policy_loss = -(
+                        torch.min(surr1, surr2) * masks
+                ).sum() / denom
+
+                value_loss = (
+                                     ((returns - values) ** 2) * masks
+                             ).sum() / denom
+
                 entropy_loss = (entropy * masks).sum() / denom
 
-                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy_loss
+                loss = (
+                        policy_loss
+                        + value_coef * value_loss
+                        - entropy_coef * entropy_loss
+                )
 
                 with torch.no_grad():
-                    approx_kl = ((old_logp - new_logp) * masks).sum() / denom
-                    clipped = ((ratio > 1.0 + clip_coef) | (ratio < 1.0 - clip_coef)).float()
-                    clip_fraction = (clipped * masks).sum() / denom
+                    approx_kl = (
+                            ((old_logp - new_logp) * masks).sum()
+                            / denom
+                    )
+
+                    clipped = (
+                            (ratio > 1.0 + clip_coef)
+                            | (ratio < 1.0 - clip_coef)
+                    ).float()
+
+                    clip_fraction = (
+                            (clipped * masks).sum() / denom
+                    )
 
                     var_y = torch.var((returns * masks))
-                    explained_variance = 1 - torch.var(((returns - values) * masks)) / (var_y + 1e-8)
+
+                    explained_variance = 1 - torch.var(
+                        ((returns - values) * masks)
+                    ) / (var_y + 1e-8)
+
                 optim.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    params,
+                    max_grad_norm,
+                )
                 optim.step()
+
                 policy_loss_epoch += float(policy_loss.item())
                 value_loss_epoch += float(value_loss.item())
                 entropy_epoch += float(entropy_loss.item())
@@ -530,7 +585,6 @@ class MAPPOManager(object):
                 ev_epoch += float(explained_variance.item())
                 num_updates += 1
 
-        # clear buffer after update
         self.buffer.clear()
 
         if num_updates == 0:
@@ -542,7 +596,7 @@ class MAPPOManager(object):
             "entropy": entropy_epoch / num_updates,
             "approx_kl": kl_epoch / num_updates,
             "clip_fraction": clip_frac_epoch / num_updates,
-            "explained_variance": ev_epoch / num_updates
+            "explained_variance": ev_epoch / num_updates,
         }
 
         return stats
@@ -1792,8 +1846,20 @@ class MAPPOManager(object):
                 pass
 
     def load_all(self, prefix: str, map_location=None) -> None:
+        map_location = map_location or self.device
+
         for slot, agent in self.agents.items():
-            try:
-                agent.load(f"{prefix}_{slot}", map_location=map_location)
-            except Exception:
-                pass
+            path = f"{prefix}_{slot}.pt"
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+            print(f"[LOAD] slot {slot} from {path}")
+            ckpt = torch.load(path, map_location=map_location)
+
+            if isinstance(ckpt, dict) and "model" in ckpt:
+                agent.load_state_dict(ckpt["model"])
+                if "optimizer" in ckpt and self.optim is not None:
+                    self.optim.load_state_dict(ckpt["optimizer"])
+            else:
+                # backward compatibility
+                agent.load_state_dict(ckpt)

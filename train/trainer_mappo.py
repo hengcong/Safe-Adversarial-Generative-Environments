@@ -31,6 +31,8 @@ class MAPPOTrainer(Trainer):
                  **kwargs):
         super().__init__(envs=envs, manager=manager, device=device, **kwargs)
         self.T = int(num_steps)
+        self.rollouts_per_update = 8
+        self._rollout_counter = 0
         self.tb = SummaryWriter(log_dir=envs.experiment_path)
         self.global_ep = 0
         self._coll_hist = []
@@ -177,14 +179,17 @@ class MAPPOTrainer(Trainer):
         obs = env.get_single_obs_for_manager()
 
         # 3. Reset buffer and store the INITIAL hidden state
-        manager.reset_buffer()
-        manager.buffer.set_initial_hidden(hidden_slot, hidden_bev)
+        if self._rollout_counter == 0:
+            manager.reset_buffer()
+            manager.buffer.set_initial_hidden(hidden_slot, hidden_bev)
 
         # 4. Start the rollout loop
         ep_len = 0
         ep_return = 0.0
         all_rewards = []
         last_env_info = {}
+        cbf_intervention_total = 0
+        agent_step_total = 0
         for t in range(T):
             ep_len += 1
             actions, values, logps, next_slot_h, next_bev_h, policy_info = manager.select_actions(
@@ -194,7 +199,37 @@ class MAPPOTrainer(Trainer):
             )
             next_obs, rewards_dict, dones_dict, env_info = env.step(actions)
 
-            # --- [LOGGING UPDATE] KEEP THIS! ---
+            # --- CORRECT: reset next_slot_h (NOT hidden["slot"]) for respawned/dead agents ---
+            slot_list = manager.agent_slots
+            if next_slot_h is not None:
+                # ensure tensor on device
+                if not torch.is_tensor(next_slot_h):
+                    next_slot_h = torch.as_tensor(next_slot_h)
+                device = next_slot_h.device
+                respawn_mask = torch.tensor([[1.0 if dones_dict.get(s, False) else 0.0 for s in slot_list]],
+                                            dtype=torch.float32, device=device)  # [B, N]
+
+                if respawn_mask.sum().item() > 0.0:
+                    try:
+                        # prefer policy helper
+                        next_slot_h = manager.policy.reset_hidden_for_agents(next_slot_h, respawn_mask)
+                        next_slot_h = next_slot_h.detach()
+                    except Exception:
+                        mask = respawn_mask.unsqueeze(-1)  # [B, N, 1]
+                        zeros = torch.zeros_like(next_slot_h)
+                        next_slot_h = (next_slot_h * (1.0 - mask) + zeros * mask).to(device)
+
+            # now update hidden dict from the *updated* next_slot_h / next_bev_h
+            hidden = {"slot": next_slot_h, "bev": next_bev_h}
+
+            # --- ESSENTIAL: accumulate per-step safety stats from env_info (restore original per-step counters) ---
+            # prefer explicit keys used by env: use 'intervention_this_step' if present, otherwise fallback to cbf_step_interventions
+            cbf_this = int(env_info.get("intervention_this_step", env_info.get("cbf_step_interventions", 0)))
+            active_this = int(env_info.get("active_agent_count", 0))
+            cbf_intervention_total += cbf_this
+            agent_step_total += active_this
+
+            # keep last_env_info / reward logging
             last_env_info = env_info
             step_reward = np.mean(list(rewards_dict.values()))
             ep_return += step_reward
@@ -210,10 +245,9 @@ class MAPPOTrainer(Trainer):
                 info_dict=policy_info,
                 hidden_dict=hidden
             )
-            hidden = {"slot": next_slot_h, "bev": next_bev_h}
             obs = next_obs
 
-            if any(dones_dict.values()):
+            if all(dones_dict.get(s, False) for s in manager.agent_slots):
                 break
 
         # =======================
@@ -236,19 +270,68 @@ class MAPPOTrainer(Trainer):
             last_vals_arr = np.zeros((1, len(slot_list)), dtype=np.float32)
 
         manager.finish_rollouts(last_vals_arr)
-
+        if agent_step_total > 0:
+            cbf_rate = cbf_intervention_total / agent_step_total
+        else:
+            cbf_rate = 0.0
         # =======================
         # 4. UPDATE
         # =======================
-        stats = manager.update_all()
+        self._rollout_counter += 1
+
+        if self._rollout_counter >= self.rollouts_per_update:
+            stats = manager.update_all()
+            self._rollout_counter = 0
+
+            if stats is not None:
+                for k, v in stats.items():
+                    self.tb.add_scalar(f"ppo/{k}", v, self.global_step)
+        else:
+            stats = None
 
         if stats is not None:
             for k, v in stats.items():
-                self.tb.add_scalar(f"train/{k}", v, self.global_step)
+                self.tb.add_scalar(f"ppo/{k}", v, self.global_step)
 
         if hasattr(self, "tb"):
-            self.tb.add_scalar("train/ep_return", ep_return, self.global_step)
-            self.tb.add_scalar("train/ep_len", ep_len, self.global_step)
+            self.tb.add_scalar("behavior/ep_return", ep_return, self.global_step)
+            self.tb.add_scalar("behavior/ep_len", ep_len, self.global_step)
+            self.tb.add_scalar("safety/cbf_intervention_rate", cbf_rate, self.global_step)
+
+            ep_data = env.episode_data
+            n = max(ep_data.get("agent_step_count", 1), 1)
+
+            avg_speed = ep_data.get("speed_sum", 0.0) / n
+            avg_acc = ep_data.get("acc_sum", 0.0) / n
+            avg_ttc = ep_data.get("ttc_sum", 0.0) / n
+
+            min_ttc = ep_data.get("ttc_min", float("inf"))
+            if min_ttc == float("inf"):
+                min_ttc = 0.0
+
+            # ego collision: boolean flag (1 if ego was hit this episode, else 0)
+            ego_collision = float(ep_data.get("collision_happened", 0))
+
+            # keep total collision count as an additional scalar for context
+            collision_count = len(ep_data.get("_collision_slots", set()))
+            controlled_agent_num = len(manager.agent_slots)
+            collision_rate = collision_count / max(controlled_agent_num, 1)
+            self.tb.add_scalar("safety/collision_rate", collision_rate, self.global_step)
+            intervention_mag = ep_data.get("intervention_mag_sum", 0.0) / n
+            return_variance = np.var(all_rewards) if len(all_rewards) > 0 else 0.0
+
+            self.tb.add_scalar("behavior/avg_speed", avg_speed, self.global_step)
+            self.tb.add_scalar("behavior/avg_acc", avg_acc, self.global_step)
+            self.tb.add_scalar("safety/avg_ttc", avg_ttc, self.global_step)
+            self.tb.add_scalar("safety/min_ttc", min_ttc, self.global_step)
+
+            # New: ego collision boolean
+            self.tb.add_scalar("safety/ego_collision", ego_collision, self.global_step)
+            # Keep total collision count for diagnostics
+            self.tb.add_scalar("safety/collision_count", collision_count, self.global_step)
+
+            self.tb.add_scalar("safety/intervention_magnitude", intervention_mag, self.global_step)
+            self.tb.add_scalar("behavior/return_variance", return_variance, self.global_step)
 
         self.global_step += 1
 
