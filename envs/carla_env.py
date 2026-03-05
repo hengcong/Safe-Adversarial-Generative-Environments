@@ -1596,13 +1596,11 @@ class CarlaEnv(gym.Env):
         reward = (
                 0.4 * r_speed +
                 0.6 * r_direction +
-                0.5 * r_lane +
+                0.2 * r_lane +
                 0.8 * r_dist +
                 1.0 * r_att +
                 penalty
         )
-
-        reward = np.clip(reward, -3.0, 3.0)
 
         # ======================
         # 6) Longitudinal smoothness penalty (NEW)
@@ -1622,7 +1620,8 @@ class CarlaEnv(gym.Env):
         self.episode_data["global_step"] = t + 1
 
         w_smooth = min(0.05, 0.05 * t / 5000.0)  #
-        r_smooth = -w_smooth * (acc - prev_acc) ** 2
+        delta_acc = acc - prev_acc
+        r_smooth = -w_smooth * min(delta_acc * delta_acc, 4.0)
 
         # update history
         self.episode_data[key_v] = v
@@ -1630,6 +1629,7 @@ class CarlaEnv(gym.Env):
 
         # add to reward
         reward += r_smooth
+        reward = np.clip(reward, -3.0, 3.0)
 
         return float(reward)
 

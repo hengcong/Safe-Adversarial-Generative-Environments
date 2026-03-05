@@ -299,7 +299,7 @@ class MAPPOManager(object):
             ppo_epochs=2,
             clip_coef=0.2,
             value_coef=0.1,
-            entropy_coef=0.02,
+            entropy_coef=0.002,
             max_grad_norm=0.5,
             num_mini_batches=4,
     ):
