@@ -184,7 +184,7 @@ class RolloutBuffer:
 
             adv = delta + self.gamma * self.gae_lambda * adv * mask_t
             self.advantages[t] = adv
-            next_values = values_t#* mask_t
+            next_values = values_t * mask_t
 
         # returns = advantages + values
         self.returns = self.advantages + self.values
@@ -198,8 +198,11 @@ class RolloutBuffer:
             adv_mean = valid_adv.mean()
             adv_std = valid_adv.std() + 1e-8
 
-            self.advantages = (self.advantages - adv_mean) / adv_std
-            self.advantages *= self.masks
+            self.advantages[valid_mask] = (
+                    (self.advantages[valid_mask] - adv_mean) / adv_std
+            )
+            # self.advantages = (self.advantages - adv_mean) / adv_std
+            # self.advantages *= self.masks
 
     def feed_forward_generator(self, num_mini_batches=4):
         # Buffer is Time-Major: [T, B, N, ...]

@@ -297,9 +297,9 @@ class MAPPOManager(object):
     def update_all(
             self,
             ppo_epochs=2,
-            clip_coef=0.2,
-            value_coef=0.1,
-            entropy_coef=0.002,
+            clip_coef=0.1,
+            value_coef=0.2,
+            entropy_coef=0.001,
             max_grad_norm=0.5,
             num_mini_batches=4,
     ):
@@ -334,11 +334,6 @@ class MAPPOManager(object):
                 old_logp = batch["logp"]
                 returns = batch["returns"]
                 advantages = batch["advantages"].to(device)
-
-                with torch.no_grad():
-                    adv_mean = advantages.mean()
-                    adv_std = advantages.std()
-                    advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
                 masks = batch["masks"]
                 init_slot = batch.get("init_slot_hidden", None)

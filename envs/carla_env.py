@@ -81,8 +81,10 @@ class CarlaEnv(gym.Env):
             }
         }
 
+
         # BEV / per-agent observation specs (must be initialized before policy ctor)
         # self.obs_dim = getattr(self, "obs_dim", 128)  # per-agent scalar feature dim (F_agent)
+        self.bev_radius = 50.0
         self.bev_ch = getattr(self, "bev_ch", 3)  # BEV image channels (3 = RGB)
         self.bev_H = getattr(self, "bev_H", 84)  # BEV height
         self.bev_W = getattr(self, "bev_W", 84)  # BEV width
@@ -792,6 +794,10 @@ class CarlaEnv(gym.Env):
         self.vehicle_map = self._group_vehicles_by_road_and_lane()
 
         self.agent_ids = self.get_background_agents()
+        print("===== RESET DEBUG =====")
+        print("BEV radius:", getattr(self, "bev_radius", None))
+        print("nearby agents:", len(self.agent_ids))
+        print("========================")
         if len(self.agent_ids) == 0:
             print("[RESET] No agents, regenerating episode...")
             return self.reset()
@@ -1047,8 +1053,10 @@ class CarlaEnv(gym.Env):
 
         # ---------------- build agent features / type / mask arrays (no batch dim) ----------------
         agent_feats = np.zeros((N, F), dtype=np.float32)
+
         type_ids = np.zeros((N,), dtype=np.int64)  # 0 = padding/empty, 1 = vehicle, 2 = pedestrian
         mask = np.zeros((N,), dtype=np.float32)
+
 
         for i, aid in enumerate(slot2actor):
             if aid is None:
@@ -1458,7 +1466,7 @@ class CarlaEnv(gym.Env):
 
         return next_obs, rewards, dones, info
 
-    def get_background_agents(self, radius=200.0):
+    def get_background_agents(self, radius=50.0):
         ego_loc = self.ego_vehicle.get_location()
         cand = []
 
@@ -1569,6 +1577,9 @@ class CarlaEnv(gym.Env):
         else:
             r_dist = 0.0
 
+        # ttc_ref = 1.5
+        # r_dist = -np.exp(-ttc / ttc_ref)
+
         # ======================
         # 5) Attitude stability penalty
         # ======================
@@ -1594,13 +1605,42 @@ class CarlaEnv(gym.Env):
         # Final weighted reward
         # ======================
         reward = (
-                0.4 * r_speed +
-                0.6 * r_direction +
-                0.2 * r_lane +
-                0.8 * r_dist +
+                0.35 * r_speed +
+                0.35 * r_direction +
+                0.1 * r_lane +
+                0.3 * r_dist +
                 1.0 * r_att +
                 penalty
         )
+        # ===== Progress reward =====
+        key_loc = f"last_loc_{actor_id}"
+        prev_loc = self.episode_data.get(key_loc, loc)
+
+        dx = loc.x - prev_loc.x
+        dy = loc.y - prev_loc.y
+
+        delta_vec = np.array([dx, dy, 0.0])
+        lane_fwd = np.array([fwd[0], fwd[1], 0.0])
+
+        delta_s = np.dot(delta_vec, lane_fwd)
+        delta_s = max(delta_s, 0.0)
+
+        # normalize by maximum possible step distance
+        max_step_progress = speed_limit * self.step_size
+
+        progress_reward = np.clip(delta_s / (max_step_progress + 1e-6), 0.0, 1.0)
+        # delta_s = np.dot(delta_vec, lane_fwd)
+        # delta_s = max(delta_s, 0.0)
+        #
+        # # simple progress reward (meters traveled forward)
+        # # scale down since typical progress per step is 0-1 meters
+        # progress_reward = np.clip(delta_s * 0.1, 0.0, 1.0)
+
+        if penalty < 0:
+            progress_reward *= 0.2
+
+        reward += progress_reward
+        self.episode_data[key_loc] = loc
 
         # ======================
         # 6) Longitudinal smoothness penalty (NEW)
@@ -1632,84 +1672,84 @@ class CarlaEnv(gym.Env):
         reward = np.clip(reward, -3.0, 3.0)
 
         return float(reward)
-
-    def _compute_reward_components(self, actor_id):
-        """
-        Logging only.
-        DOES NOT affect training.
-        """
-        actor = self.world.get_actor(actor_id)
-        if actor is None or self.ego_vehicle is None:
-            return None
-
-        vel = actor.get_velocity()
-        v = np.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
-
-        loc = actor.get_location()
-        ego_loc = self.ego_vehicle.get_location()
-        dist = ego_loc.distance(loc)
-
-        wp = self.map.get_waypoint(loc, project_to_road=False)
-        if wp is None:
-            return None
-
-        # ---------- speed ----------
-        v_target = 8.0
-        v_tol = 2.0
-        r_speed = 0.4 * np.exp(-((v - v_target) ** 2) / (2 * v_tol ** 2))
-
-        # ---------- direction ----------
-        forward = wp.transform.get_forward_vector()
-        fwd = np.array([forward.x, forward.y, forward.z])
-        vel_vec = np.array([vel.x, vel.y, vel.z])
-
-        if np.linalg.norm(vel_vec) > 1e-3:
-            dir_align = np.dot(vel_vec, fwd) / (
-                    np.linalg.norm(vel_vec) * np.linalg.norm(fwd) + 1e-6
-            )
-            dir_align = np.clip(dir_align, -1.0, 1.0)
-        else:
-            dir_align = 0.0
-
-        r_direction = 0.6 * max(dir_align, 0.0)
-
-        # ---------- lane ----------
-        lane_center = wp.transform.location
-        lane_width = max(wp.lane_width, 1.0)
-        lateral_dist = lane_center.distance(loc)
-        lateral_norm = lateral_dist / (0.5 * lane_width)
-        r_lane = 0.5 * (-np.clip(lateral_norm ** 2, 0.0, 4.0))
-
-        # ---------- TTC ----------
-        ego_vel = self.ego_vehicle.get_velocity()
-        ego_v = np.array([ego_vel.x, ego_vel.y, ego_vel.z])
-        rel_vel = ego_v - vel_vec
-        closing_speed = np.dot(rel_vel, fwd)
-
-        if closing_speed > 1e-3:
-            ttc = dist / closing_speed
-        else:
-            ttc = np.inf
-
-        if ttc < 3.0:
-            r_dist = 0.8 * (-((3.0 - ttc) / 3.0) ** 2)
-        else:
-            r_dist = 0.0
-
-        # ---------- attitude ----------
-        tr = actor.get_transform()
-        roll = abs(tr.rotation.roll)
-        pitch = abs(tr.rotation.pitch)
-        r_att = -0.01 * (roll / 45.0) ** 2 - 0.01 * (pitch / 45.0) ** 2
-
-        return {
-            "speed": r_speed,
-            "direction": r_direction,
-            "lane": r_lane,
-            "ttc": r_dist,
-            "att": r_att,
-            "sum": r_speed + r_direction + r_lane + r_dist + r_att
-        }
+    #
+    # def _compute_reward_components(self, actor_id):
+    #     """
+    #     Logging only.
+    #     DOES NOT affect training.
+    #     """
+    #     actor = self.world.get_actor(actor_id)
+    #     if actor is None or self.ego_vehicle is None:
+    #         return None
+    #
+    #     vel = actor.get_velocity()
+    #     v = np.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+    #
+    #     loc = actor.get_location()
+    #     ego_loc = self.ego_vehicle.get_location()
+    #     dist = ego_loc.distance(loc)
+    #
+    #     wp = self.map.get_waypoint(loc, project_to_road=False)
+    #     if wp is None:
+    #         return None
+    #
+    #     # ---------- speed ----------
+    #     v_target = 8.0
+    #     v_tol = 2.0
+    #     r_speed = 0.4 * np.exp(-((v - v_target) ** 2) / (2 * v_tol ** 2))
+    #
+    #     # ---------- direction ----------
+    #     forward = wp.transform.get_forward_vector()
+    #     fwd = np.array([forward.x, forward.y, forward.z])
+    #     vel_vec = np.array([vel.x, vel.y, vel.z])
+    #
+    #     if np.linalg.norm(vel_vec) > 1e-3:
+    #         dir_align = np.dot(vel_vec, fwd) / (
+    #                 np.linalg.norm(vel_vec) * np.linalg.norm(fwd) + 1e-6
+    #         )
+    #         dir_align = np.clip(dir_align, -1.0, 1.0)
+    #     else:
+    #         dir_align = 0.0
+    #
+    #     r_direction = 0.6 * max(dir_align, 0.0)
+    #
+    #     # ---------- lane ----------
+    #     lane_center = wp.transform.location
+    #     lane_width = max(wp.lane_width, 1.0)
+    #     lateral_dist = lane_center.distance(loc)
+    #     lateral_norm = lateral_dist / (0.5 * lane_width)
+    #     r_lane = 0.5 * (-np.clip(lateral_norm ** 2, 0.0, 4.0))
+    #
+    #     # ---------- TTC ----------
+    #     ego_vel = self.ego_vehicle.get_velocity()
+    #     ego_v = np.array([ego_vel.x, ego_vel.y, ego_vel.z])
+    #     rel_vel = ego_v - vel_vec
+    #     closing_speed = np.dot(rel_vel, fwd)
+    #
+    #     if closing_speed > 1e-3:
+    #         ttc = dist / closing_speed
+    #     else:
+    #         ttc = np.inf
+    #
+    #     if ttc < 3.0:
+    #         r_dist = 0.8 * (-((3.0 - ttc) / 3.0) ** 2)
+    #     else:
+    #         r_dist = 0.0
+    #
+    #     # ---------- attitude ----------
+    #     tr = actor.get_transform()
+    #     roll = abs(tr.rotation.roll)
+    #     pitch = abs(tr.rotation.pitch)
+    #     r_att = -0.01 * (roll / 45.0) ** 2 - 0.01 * (pitch / 45.0) ** 2
+    #
+    #     return {
+    #         "speed": r_speed,
+    #         "direction": r_direction,
+    #         "lane": r_lane,
+    #         "ttc": r_dist,
+    #         "att": r_att,
+    #         "sum": r_speed + r_direction + r_lane + r_dist + r_att
+    #     }
 
     def _check_done(self, actor_id):
         actor = self.world.get_actor(actor_id)

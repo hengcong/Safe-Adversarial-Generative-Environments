@@ -34,7 +34,7 @@ def policy_ctor_from_spec(spec):
         use_bev_gru=spec.get("use_bev_gru", True),
         use_slot_gru=spec.get("use_slot_gru", True),
         global_ctx_dim=spec.get("global_ctx_dim", 256),
-        action_scale=spec.get("action_scale", 5.0),
+        action_scale=spec.get("action_scale", 1.0),
         log_std_init=spec.get("log_std_init", 0.0),
         device=spec.get("device", "cuda"),
     )
