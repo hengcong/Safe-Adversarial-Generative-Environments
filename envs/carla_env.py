@@ -960,7 +960,7 @@ class CarlaEnv(gym.Env):
         self.episode_data["intervention_mag_sum"] = 0.0
         self.episode_data["agent_step_count"] = 0
 
-        self.step_data = {}
+        self.step_data = {"reward_components": []}
         self.last_location = self.ego_vehicle.get_location()
         self.start_time = self.get_simulation_time()
         self.distance_travelled = 0.0
@@ -1509,24 +1509,29 @@ class CarlaEnv(gym.Env):
         v = np.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
 
         loc = actor.get_location()
+        # store loc as tuple of floats to avoid object-reference aliasing
+        loc_tuple = (float(loc.x), float(loc.y), float(loc.z))
+
         ego_loc = self.ego_vehicle.get_location()
-        dist = ego_loc.distance(loc)
+        # ego loc tuple not strictly required, but keep consistent
+        ego_loc_tuple = (float(ego_loc.x), float(ego_loc.y), float(ego_loc.z))
+        dist = np.sqrt((loc_tuple[0] - ego_loc_tuple[0]) ** 2 + (loc_tuple[1] - ego_loc_tuple[1]) ** 2)
 
         wp = self.map.get_waypoint(loc, project_to_road=False)
         if wp is None:
             return -1.0
 
         # ======================
-        # 1) Speed reward (bounded)
+        # 1) Speed reward (bounded, ~0..1)
         # ======================
         speed_limit = self.get_speed_limit(actor)
         v_target = 0.9 * speed_limit
-        v_tol = 2.0
+        v_tol = max(1.0, 0.2 * max(1.0, speed_limit))  # make tolerance relative to speed_limit
 
-        r_speed = np.exp(-((v - v_target) ** 2) / (2 * v_tol ** 2))
+        r_speed = float(np.exp(-((v - v_target) ** 2) / (2 * (v_tol ** 2))))
 
         # ======================
-        # 2) Direction alignment with lane
+        # 2) Direction alignment with lane (0..1)
         # ======================
         forward = wp.transform.get_forward_vector()
         fwd = np.array([forward.x, forward.y, forward.z])
@@ -1540,110 +1545,102 @@ class CarlaEnv(gym.Env):
         else:
             dir_align = 0.0
 
-        r_direction = max(dir_align, 0.0)
+        r_direction = float(max(dir_align, 0.0))
 
         # ======================
-        # 3) Lateral deviation penalty
+        # 3) Lateral deviation penalty (smooth, small negative)
         # ======================
-        lane_center = wp.transform.location
+        wp_loc = wp.transform.location
+        right = wp.transform.get_right_vector()
+
+        right_vec = np.array([right.x, right.y, 0.0])
+        rel = np.array([loc.x - wp_loc.x, loc.y - wp_loc.y, 0.0])
         lane_width = max(wp.lane_width, 1.0)
-
-        lateral_dist = lane_center.distance(loc)
+        lateral_dist = abs(np.dot(rel, right_vec))
         lateral_norm = lateral_dist / (0.5 * lane_width)
-
-        r_lane = -np.clip(lateral_norm ** 2, 0.0, 4.0)
+        # smooth quadratic penalty but small magnitude
+        r_lane = -float(np.clip((lateral_norm ** 2) * 0.25, 0.0, 1.0))  # scaled down
 
         # ======================
-        # 4) TTC-based safety penalty (NEW)
+        # 4) TTC-based safety penalty (continuous, bounded [-1,0])
         # ======================
-        # relative speed along lane direction
         ego_vel = self.ego_vehicle.get_velocity()
         ego_v = np.array([ego_vel.x, ego_vel.y, ego_vel.z])
+        rel_pos = np.array([loc.x - ego_loc.x, loc.y - ego_loc.y, 0.0])
+        rel_vel = vel_vec - ego_v
 
-        rel_vel = ego_v - vel_vec
-        closing_speed = np.dot(rel_vel, fwd)  #
+        forward_unit = np.array([fwd[0], fwd[1], 0.0])
+        norm_fwd = np.linalg.norm(forward_unit) + 1e-6
+        forward_unit /= norm_fwd
 
-        # compute TTC
-        eps = 1e-3
-        if closing_speed > eps:
-            ttc = dist / closing_speed
-        else:
+        long_dist = np.dot(rel_pos, forward_unit)
+        closing_speed = -np.dot(rel_vel, forward_unit)
+
+        max_ttc_dist = 50.0
+        eps = 1e-6
+
+        # if not closing or out of range -> large safe ttc (no penalty)
+        if long_dist <= 0.0 or long_dist > max_ttc_dist or closing_speed <= eps:
             ttc = np.inf
+        else:
+            ttc = float(long_dist / (closing_speed + eps))
 
-        # TTC penalty
-        ttc_safe = 3.0  # seconds
-        if ttc < ttc_safe:
-            r_dist = -((ttc_safe - ttc) / ttc_safe) ** 2
+        # continuous penalty: -1/(ttc + 1) mapped to (-1,0]; clip at -1
+        if np.isfinite(ttc):
+            r_dist = -float(np.clip(1.0 / (ttc + 1.0), 0.0, 1.0))
         else:
             r_dist = 0.0
 
-        # ttc_ref = 1.5
-        # r_dist = -np.exp(-ttc / ttc_ref)
-
         # ======================
-        # 5) Attitude stability penalty
+        # 5) Attitude stability penalty (very small)
         # ======================
         tr = actor.get_transform()
         roll = abs(tr.rotation.roll)
         pitch = abs(tr.rotation.pitch)
-
-        r_att = -0.01 * (roll / 45.0) ** 2 - 0.01 * (pitch / 45.0) ** 2
+        r_att = -0.005 * ((roll / 45.0) ** 2) - 0.005 * ((pitch / 45.0) ** 2)
+        r_att = float(r_att)
 
         # ======================
-        # Collision / Off-road penalty
+        # Collision / Off-road penalty (conservative)
         # ======================
         penalty = 0.0
         if hasattr(self, "slot2actor") and actor_id in self.slot2actor:
             try:
                 slot_idx = self.slot2actor.index(actor_id)
                 if hasattr(self, "_bg_collision_slots") and slot_idx in self._bg_collision_slots:
-                    penalty = -1.5
+                    penalty = -1.0  # less severe than -1.5
             except ValueError:
                 pass
 
         # ======================
-        # Final weighted reward
+        # Progress reward (normalized by max possible per step)
         # ======================
-        reward = (
-                0.35 * r_speed +
-                0.35 * r_direction +
-                0.1 * r_lane +
-                0.3 * r_dist +
-                1.0 * r_att +
-                penalty
-        )
-        # ===== Progress reward =====
         key_loc = f"last_loc_{actor_id}"
-        prev_loc = self.episode_data.get(key_loc, loc)
+        prev_loc = self.episode_data.get(key_loc, None)
+        if prev_loc is None:
+            # store numeric tuple, no reward this first step
+            self.episode_data[key_loc] = loc_tuple
+            progress_reward = 0.0
+        else:
+            dx = loc_tuple[0] - prev_loc[0]
+            dy = loc_tuple[1] - prev_loc[1]
+            delta_vec = np.array([dx, dy, 0.0])
+            lane_fwd = np.array([fwd[0], fwd[1], 0.0])
+            delta_s = np.dot(delta_vec, lane_fwd)
+            delta_s = max(delta_s, 0.0)
 
-        dx = loc.x - prev_loc.x
-        dy = loc.y - prev_loc.y
+            max_step_progress = max(1e-3, speed_limit * (getattr(self, "step_size", 0.1)))
+            progress_reward = float(np.clip(delta_s / (max_step_progress + 1e-6), 0.0, 1.0))
 
-        delta_vec = np.array([dx, dy, 0.0])
-        lane_fwd = np.array([fwd[0], fwd[1], 0.0])
+            # update stored prev_loc
+            self.episode_data[key_loc] = loc_tuple
 
-        delta_s = np.dot(delta_vec, lane_fwd)
-        delta_s = max(delta_s, 0.0)
-
-        # normalize by maximum possible step distance
-        max_step_progress = speed_limit * self.step_size
-
-        progress_reward = np.clip(delta_s / (max_step_progress + 1e-6), 0.0, 1.0)
-        # delta_s = np.dot(delta_vec, lane_fwd)
-        # delta_s = max(delta_s, 0.0)
-        #
-        # # simple progress reward (meters traveled forward)
-        # # scale down since typical progress per step is 0-1 meters
-        # progress_reward = np.clip(delta_s * 0.1, 0.0, 1.0)
-
-        if penalty < 0:
-            progress_reward *= 0.2
-
-        reward += progress_reward
-        self.episode_data[key_loc] = loc
+        # if collision penalty applied, subtract a fixed amount from progress (not multiply)
+        if penalty < 0.0 and progress_reward > 0.0:
+            progress_reward = max(0.0, progress_reward - 0.2)
 
         # ======================
-        # 6) Longitudinal smoothness penalty (NEW)
+        # 6) Longitudinal smoothness penalty (jerk-like, small constant weight)
         # ======================
         key_acc = f"last_acc_{actor_id}"
         key_v = f"last_speed_{actor_id}"
@@ -1651,27 +1648,245 @@ class CarlaEnv(gym.Env):
         prev_v = self.episode_data.get(key_v, v)
         prev_acc = self.episode_data.get(key_acc, 0.0)
 
-        dt = self.step_size
-        acc = (v - prev_v) / max(dt, 1e-3)
+        dt = max(getattr(self, "step_size", 0.1), 1e-3)
+        acc = (v - prev_v) / dt
 
-        # jerk-like penalty (penalize rapid acc change)
-        # step-based annealing for smoothness
-        t = self.episode_data.get("global_step", 0)
-        self.episode_data["global_step"] = t + 1
-
-        w_smooth = min(0.05, 0.05 * t / 5000.0)  #
         delta_acc = acc - prev_acc
-        r_smooth = -w_smooth * min(delta_acc * delta_acc, 4.0)
+        w_smooth = 0.01  # small fixed weight (schedule externally if desired)
+        r_smooth = -w_smooth * float(min(delta_acc * delta_acc, 4.0))
 
-        # update history
         self.episode_data[key_v] = v
         self.episode_data[key_acc] = acc
 
-        # add to reward
-        reward += r_smooth
-        reward = np.clip(reward, -3.0, 3.0)
+        # ======================
+        # Final weighted reward (weights chosen to keep magnitude ~[-2,2])
+        # ======================
+        reward = (
+                0.30 * r_speed +  # encourage near-target speed
+                0.30 * r_direction +  # keep aligned with lane
+                0.10 * r_lane +  # small lateral penalty
+                0.25 * r_dist +  # safety penalty (negative)
+                0.10 * r_att +  # tiny attitude penalty
+                0.0 * penalty  # keep collision as separate diagnostic; apply externally if needed
+        )
 
+        # add progress and smoothness but with smaller weight
+        reward = reward + 0.25 * progress_reward + 1.0 * r_smooth
+
+        # final clipping for numerical stability
+        reward = float(np.clip(reward, -3.0, 3.0))
+
+        # ======================
+        # Logging reward components
+        # ======================
+
+        if "reward_components" not in self.step_data:
+            self.step_data["reward_components"] = []
+
+        self.step_data["reward_components"].append({
+            "speed": r_speed,
+            "direction": r_direction,
+            "lane": r_lane,
+            "ttc": r_dist,
+            "attitude": r_att,
+            "progress": progress_reward,
+            "smooth": r_smooth,
+            "collision_penalty": penalty,
+            "total": reward
+        })
         return float(reward)
+    #
+    # def _compute_reward(self, actor_id):
+    #     actor = self.world.get_actor(actor_id)
+    #     if actor is None or self.ego_vehicle is None:
+    #         return 0.0
+    #
+    #     # ======================
+    #     # Basic kinematics
+    #     # ======================
+    #     vel = actor.get_velocity()
+    #     v = np.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+    #
+    #     loc = actor.get_location()
+    #     ego_loc = self.ego_vehicle.get_location()
+    #     dist = ego_loc.distance(loc)
+    #
+    #     wp = self.map.get_waypoint(loc, project_to_road=False)
+    #     if wp is None:
+    #         return -1.0
+    #
+    #     # ======================
+    #     # 1) Speed reward (bounded)
+    #     # ======================
+    #     speed_limit = self.get_speed_limit(actor)
+    #     v_target = 0.9 * speed_limit
+    #     v_tol = 2.0
+    #
+    #     r_speed = np.exp(-((v - v_target) ** 2) / (2 * v_tol ** 2))
+    #
+    #     # ======================
+    #     # 2) Direction alignment with lane
+    #     # ======================
+    #     forward = wp.transform.get_forward_vector()
+    #     fwd = np.array([forward.x, forward.y, forward.z])
+    #     vel_vec = np.array([vel.x, vel.y, vel.z])
+    #
+    #     if np.linalg.norm(vel_vec) > 1e-3:
+    #         dir_align = np.dot(vel_vec, fwd) / (
+    #                 np.linalg.norm(vel_vec) * np.linalg.norm(fwd) + 1e-6
+    #         )
+    #         dir_align = np.clip(dir_align, -1.0, 1.0)
+    #     else:
+    #         dir_align = 0.0
+    #
+    #     r_direction = max(dir_align, 0.0)
+    #
+    #     # ======================
+    #     # 3) Lateral deviation penalty
+    #     # ======================
+    #     wp_loc = wp.transform.location
+    #     right = wp.transform.get_right_vector()
+    #
+    #     right_vec = np.array([right.x, right.y, 0.0])
+    #     rel = np.array([loc.x - wp_loc.x, loc.y - wp_loc.y, 0.0])
+    #     lane_width = max(wp.lane_width, 1.0)
+    #     lateral_dist = abs(np.dot(rel, right_vec))
+    #     lateral_norm = lateral_dist / (0.5 * lane_width)
+    #
+    #     r_lane = -np.clip(lateral_norm ** 2, 0.0, 4.0)
+    #
+    #     # ======================
+    #     # 4) TTC-based safety penalty (NEW)
+    #     # ======================
+    #     # relative speed along lane direction
+    #     ego_vel = self.ego_vehicle.get_velocity()
+    #     ego_v = np.array([ego_vel.x, ego_vel.y, ego_vel.z])
+    #     # ego_vel and ego_v already computed
+    #     rel_pos = np.array([loc.x - ego_loc.x, loc.y - ego_loc.y, 0.0])
+    #     rel_vel = vel_vec - ego_v
+    #
+    #     # forward unit vector (2D)
+    #     forward_unit = np.array([fwd[0], fwd[1], 0.0])
+    #     norm_fwd = np.linalg.norm(forward_unit) + 1e-6
+    #     forward_unit /= norm_fwd
+    #
+    #     # longitudinal distance (projection of rel_pos onto forward axis)
+    #     long_dist = np.dot(rel_pos, forward_unit)
+    #     # relative speed along forward axis (positive = closing)
+    #     closing_speed = -np.dot(rel_vel, forward_unit)
+    #
+    #     # stability eps and max sensing distance
+    #     eps = 1e-3
+    #     max_ttc_dist = 50.0  # ignore vehicles farther than ~50 m
+    #
+    #     if long_dist <= 0.0 or long_dist > max_ttc_dist:
+    #         ttc = np.inf
+    #     else:
+    #         if closing_speed > eps:
+    #             ttc = long_dist / closing_speed
+    #         else:
+    #             ttc = np.inf
+    #
+    #     # TTC penalty: keep it smooth and clipped
+    #     ttc_safe = 4.0  # consider increasing to 4s for earlier braking
+    #     if ttc < ttc_safe:
+    #         # scale and clip penalty to avoid huge negatives
+    #         r_dist = -np.clip(((ttc_safe - ttc) / ttc_safe) ** 2, 0.0, 1.0)
+    #     else:
+    #         r_dist = 0.0
+    #
+    #     # ======================
+    #     # 5) Attitude stability penalty
+    #     # ======================
+    #     tr = actor.get_transform()
+    #     roll = abs(tr.rotation.roll)
+    #     pitch = abs(tr.rotation.pitch)
+    #
+    #     r_att = -0.01 * (roll / 45.0) ** 2 - 0.01 * (pitch / 45.0) ** 2
+    #
+    #     # ======================
+    #     # Collision / Off-road penalty
+    #     # ======================
+    #     penalty = 0.0
+    #     if hasattr(self, "slot2actor") and actor_id in self.slot2actor:
+    #         try:
+    #             slot_idx = self.slot2actor.index(actor_id)
+    #             if hasattr(self, "_bg_collision_slots") and slot_idx in self._bg_collision_slots:
+    #                 penalty = -1.5
+    #         except ValueError:
+    #             pass
+    #
+    #     # ======================
+    #     # Final weighted reward
+    #     # ======================
+    #     reward = (
+    #             0.35 * r_speed +
+    #             0.35 * r_direction +
+    #             0.1 * r_lane +
+    #             0.3 * r_dist +
+    #             1.0 * r_att +
+    #             penalty
+    #     )
+    #     # ===== Progress reward =====
+    #     key_loc = f"last_loc_{actor_id}"
+    #     prev_loc = self.episode_data.get(key_loc, loc)
+    #
+    #     dx = loc.x - prev_loc.x
+    #     dy = loc.y - prev_loc.y
+    #
+    #     delta_vec = np.array([dx, dy, 0.0])
+    #     lane_fwd = np.array([fwd[0], fwd[1], 0.0])
+    #
+    #     delta_s = np.dot(delta_vec, lane_fwd)
+    #     delta_s = max(delta_s, 0.0)
+    #
+    #     # normalize by maximum possible step distance
+    #     max_step_progress = speed_limit * self.step_size
+    #
+    #     progress_reward = np.clip(delta_s / (max_step_progress + 1e-6), 0.0, 1.0)
+    #     # delta_s = np.dot(delta_vec, lane_fwd)
+    #     # delta_s = max(delta_s, 0.0)
+    #     #
+    #     # # simple progress reward (meters traveled forward)
+    #     # # scale down since typical progress per step is 0-1 meters
+    #     # progress_reward = np.clip(delta_s * 0.1, 0.0, 1.0)
+    #
+    #     if penalty < 0:
+    #         progress_reward *= 0.2
+    #
+    #     reward += progress_reward
+    #     self.episode_data[key_loc] = loc
+    #
+    #     # ======================
+    #     # 6) Longitudinal smoothness penalty (NEW)
+    #     # ======================
+    #     key_acc = f"last_acc_{actor_id}"
+    #     key_v = f"last_speed_{actor_id}"
+    #
+    #     prev_v = self.episode_data.get(key_v, v)
+    #     prev_acc = self.episode_data.get(key_acc, 0.0)
+    #
+    #     dt = self.step_size
+    #     acc = (v - prev_v) / max(dt, 1e-3)
+    #
+    #     # jerk-like penalty (penalize rapid acc change)
+    #     # step-based annealing for smoothness
+    #     t = self.episode_data.get("global_step", 0)
+    #     self.episode_data["global_step"] = t + 1
+    #
+    #     w_smooth = min(0.05, 0.05 * t / 5000.0)  #
+    #     delta_acc = acc - prev_acc
+    #     r_smooth = -w_smooth * min(delta_acc * delta_acc, 4.0)
+    #
+    #     # update history
+    #     self.episode_data[key_v] = v
+    #     self.episode_data[key_acc] = acc
+    #
+    #     # add to reward
+    #     reward += r_smooth
+    #     reward = np.clip(reward, -3.0, 3.0)
+    #
+    #     return float(reward)
     #
     # def _compute_reward_components(self, actor_id):
     #     """

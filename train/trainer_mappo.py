@@ -289,16 +289,42 @@ class MAPPOTrainer(Trainer):
         else:
             stats = None
 
-        if stats is not None:
-            for k, v in stats.items():
-                self.tb.add_scalar(f"ppo/{k}", v, self.global_step)
-
         if hasattr(self, "tb"):
             self.tb.add_scalar("behavior/ep_return", ep_return, self.global_step)
             self.tb.add_scalar("behavior/ep_len", ep_len, self.global_step)
             self.tb.add_scalar("safety/cbf_intervention_rate", cbf_rate, self.global_step)
 
             ep_data = env.episode_data
+            reward_log = getattr(env, "step_data", {}).get("reward_components", [])
+
+            if len(reward_log) > 0:
+                r = reward_log
+
+                r_speed = np.mean([d["speed"] for d in r])
+                r_dir = np.mean([d["direction"] for d in r])
+                r_lane = np.mean([d["lane"] for d in r])
+                r_ttc = np.mean([d["ttc"] for d in r])
+                r_prog = np.mean([d["progress"] for d in r])
+                r_smooth = np.mean([d["smooth"] for d in r])
+                r_total = np.mean([d["total"] for d in r])
+
+                self.tb.add_scalar("reward/total", r_total, self.global_step)
+                self.tb.add_scalar("reward/speed", r_speed, self.global_step)
+                self.tb.add_scalar("reward/direction", r_dir, self.global_step)
+                self.tb.add_scalar("reward/lane", r_lane, self.global_step)
+                self.tb.add_scalar("reward/ttc", r_ttc, self.global_step)
+                self.tb.add_scalar("reward/progress", r_prog, self.global_step)
+                self.tb.add_scalar("reward/smooth", r_smooth, self.global_step)
+                self.tb.add_scalar(
+                    "reward_std/progress",
+                    np.std([d["progress"] for d in r]),
+                    self.global_step
+                )
+                self.tb.add_scalar(
+                    "reward_std/total",
+                    np.std([d["total"] for d in r]),
+                    self.global_step
+                )
             n = max(ep_data.get("agent_step_count", 1), 1)
 
             avg_speed = ep_data.get("speed_sum", 0.0) / n
