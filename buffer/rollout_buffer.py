@@ -190,7 +190,7 @@ class RolloutBuffer:
         self.returns = self.advantages + self.values
 
         # -------- mask-aware advantage normalization --------
-        valid_mask = self.masks > 0  # shape [T,B,N]
+        valid_mask = self.masks > 0
 
         valid_adv = self.advantages[valid_mask]
 
@@ -198,11 +198,15 @@ class RolloutBuffer:
             adv_mean = valid_adv.mean()
             adv_std = valid_adv.std() + 1e-8
 
-            self.advantages[valid_mask] = (
-                    (self.advantages[valid_mask] - adv_mean) / adv_std
-            )
-            # self.advantages = (self.advantages - adv_mean) / adv_std
-            # self.advantages *= self.masks
+            norm_adv = (valid_adv - adv_mean) / adv_std
+            norm_adv = norm_adv - norm_adv.mean()
+
+            self.advantages[valid_mask] = norm_adv
+
+            new_valid_adv = self.advantages[valid_mask]
+
+            print("adv mean/std:", new_valid_adv.mean(), new_valid_adv.std())
+            print("adv min/max:", new_valid_adv.min(), new_valid_adv.max())
 
     def feed_forward_generator(self, num_mini_batches=4):
         # Buffer is Time-Major: [T, B, N, ...]

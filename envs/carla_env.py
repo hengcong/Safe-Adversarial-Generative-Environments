@@ -1662,16 +1662,16 @@ class CarlaEnv(gym.Env):
         # Final weighted reward (weights chosen to keep magnitude ~[-2,2])
         # ======================
         reward = (
-                0.30 * r_speed +  # encourage near-target speed
+                0.15 * r_speed +  # encourage near-target speed
                 0.30 * r_direction +  # keep aligned with lane
-                0.10 * r_lane +  # small lateral penalty
-                0.25 * r_dist +  # safety penalty (negative)
-                0.10 * r_att +  # tiny attitude penalty
+                0.08 * r_lane +  # small lateral penalty
+                0.10 * r_dist +  # safety penalty (negative)
+                0.08 * r_att +  # tiny attitude penalty
                 0.0 * penalty  # keep collision as separate diagnostic; apply externally if needed
         )
 
         # add progress and smoothness but with smaller weight
-        reward = reward + 0.25 * progress_reward + 1.0 * r_smooth
+        reward = reward + 1.3 * progress_reward + 0.3 * r_smooth
 
         # final clipping for numerical stability
         reward = float(np.clip(reward, -3.0, 3.0))

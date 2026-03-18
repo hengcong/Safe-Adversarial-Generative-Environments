@@ -85,7 +85,7 @@ class MAPPOManager(object):
 
         try:
             params = [p for p in self.policy.parameters() if p.requires_grad]
-            self.optim = torch.optim.Adam(params, lr=5e-5, eps=1e-5) if params else None
+            self.optim = torch.optim.Adam(params, lr=1e-5, eps=1e-5) if params else None
         except Exception:
             self.optim = None
 
@@ -297,7 +297,7 @@ class MAPPOManager(object):
     def update_all(
             self,
             ppo_epochs=2,
-            clip_coef=0.1,
+            clip_coef=0.05,
             value_coef=0.2,
             entropy_coef=0.001,
             max_grad_norm=0.5,
