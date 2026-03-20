@@ -307,7 +307,12 @@ class MAPPOTrainer(Trainer):
                 r_prog = np.mean([d["progress"] for d in r])
                 r_smooth = np.mean([d["smooth"] for d in r])
                 r_total = np.mean([d["total"] for d in r])
-
+                r_cbf = np.mean([d.get("cbf_dev_mean", 0.0) for d in r])
+                self.tb.add_scalar("reward/cbf_deviation", r_cbf, self.global_step)
+                r_cbf_agent = np.mean([d.get("cbf_dev_agent", 0.0) for d in r])
+                self.tb.add_scalar("reward/cbf_deviation_agent", r_cbf_agent, self.global_step)
+                max_cbf = np.max([d.get("cbf_dev_agent", 0.0) for d in r])
+                self.tb.add_scalar("reward/cbf_deviation_max", max_cbf, self.global_step)
                 self.tb.add_scalar("reward/total", r_total, self.global_step)
                 self.tb.add_scalar("reward/speed", r_speed, self.global_step)
                 self.tb.add_scalar("reward/direction", r_dir, self.global_step)
