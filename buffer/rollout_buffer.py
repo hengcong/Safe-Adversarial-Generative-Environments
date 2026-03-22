@@ -184,7 +184,7 @@ class RolloutBuffer:
 
             adv = delta + self.gamma * self.gae_lambda * adv * mask_t
             self.advantages[t] = adv
-            next_values = values_t * mask_t
+            next_values = values_t #* mask_t
 
         # returns = advantages + values
         self.returns = self.advantages + self.values

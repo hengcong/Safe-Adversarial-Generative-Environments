@@ -1630,18 +1630,15 @@ class CarlaEnv(gym.Env):
 
         # continuous penalty: -1/(ttc + 1) mapped to (-1,0]; clip at -1
         if np.isfinite(ttc):
-            r_dist = -float(np.clip(1.0 / (ttc + 1.0), 0.0, 1.0))
+            if ttc < 1.5:
+                r_dist = -1.0
+            elif ttc < 3.0:
+                x = (3.0 - ttc) / 1.5  # x in (0, 1]
+                r_dist = -(x * x)  # quadratic, mild near 3s, stronger near 1.5s
+            else:
+                r_dist = 0.0
         else:
             r_dist = 0.0
-
-        if np.isfinite(ttc):
-            ttc_val = float(ttc)
-
-            if ttc_val < 1.5:
-                r_dist = -1.0
-            elif ttc_val < 3.0:
-                penalty = (3.0 - ttc_val) / 1.5
-                r_dist = -penalty
 
         r_dist = float(np.clip(r_dist, -1.0, 0.0))
 
@@ -1716,15 +1713,15 @@ class CarlaEnv(gym.Env):
                 0.60 * r_speed +
                 0.30 * r_direction +
                 0.08 * r_lane +
-                0.02 * r_dist +
+                0.10 * r_dist +
                 0.06 * r_att
         )
 
         # progress still matters, but don't let it dominate speed/safety
-        reward = reward + 1.00 * progress_reward + 0.20 * r_smooth
+        reward = reward + 0.45 * progress_reward + 0.20 * r_smooth
 
         # keep collision as diagnostic/external signal
-        reward = reward + 0.0 * penalty
+        reward = reward + 0.2 * penalty
 
         # final clipping for numerical stability
         reward = float(np.clip(reward, -3.0, 3.0))

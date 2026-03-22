@@ -494,28 +494,59 @@ class MAPPOManager(object):
                 if num_updates < 2:
                     with torch.no_grad():
                         print("===== DIAG BATCH =====")
+                        valid = masks > 0
+
+                        print("mask shape:", tuple(masks.shape))
+                        print("mask unique:", torch.unique(masks))
+                        print("valid ratio:", float(valid.float().mean().item()))
+
                         print(
-                            "advantages mean,std:",
+                            "adv all mean/std:",
                             float(advantages.mean().item()),
                             float(advantages.std().item()),
                         )
+
+                        if valid.any():
+                            print(
+                                "returns valid mean/std:",
+                                float(returns[valid].mean().item()),
+                                float(returns[valid].std().item()),
+                            )
+                            print(
+                                "values valid mean/std:",
+                                float(values[valid].mean().item()),
+                                float(values[valid].std().item()),
+                            )
+                            print(
+                                "adv valid mean/std:",
+                                float(advantages[valid].mean().item()),
+                                float(advantages[valid].std().item()),
+                            )
+                            print(
+                                "adv valid min/max:",
+                                float(advantages[valid].min().item()),
+                                float(advantages[valid].max().item()),
+                            )
+                        else:
+                            print("adv valid: EMPTY")
+
                         print(
-                            "returns mean,std:",
+                            "returns mean/std:",
                             float(returns.mean().item()),
                             float(returns.std().item()),
                         )
                         print(
-                            "values mean,std:",
+                            "values mean/std:",
                             float(values.mean().item()),
                             float(values.std().item()),
                         )
                         print(
-                            "actions mean,std:",
+                            "actions mean/std:",
                             float(actions.mean().item()),
                             float(actions.std().item()),
                         )
                         print(
-                            "old_logp mean,std:",
+                            "old_logp mean/std:",
                             float(old_logp.mean().item()),
                             float(old_logp.std().item()),
                         )
